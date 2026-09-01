@@ -1,0 +1,43 @@
+from abc import ABC, abstractmethod
+
+
+class CRMAdapter(ABC):
+
+    @abstractmethod
+    def get_clientes(self) -> list[dict]: ...
+
+    @abstractmethod
+    def get_cliente(self, record_id: str) -> dict: ...
+
+    @abstractmethod
+    def get_pedidos(self) -> list[dict]: ...
+
+    @abstractmethod
+    def crear_pedido(self, data: dict) -> dict: ...
+
+    @abstractmethod
+    def actualizar_pedido(self, record_id: str, data: dict) -> dict: ...
+
+    @abstractmethod
+    def get_productos(self) -> list[dict]: ...
+
+    @abstractmethod
+    def get_producto(self, record_id: str) -> dict: ...
+
+    @abstractmethod
+    def get_solicitudes(self) -> list[dict]: ...
+
+    @abstractmethod
+    def crear_solicitud(self, data: dict) -> dict: ...
+
+    @abstractmethod
+    def get_promos(self) -> list[dict]: ...
+
+    @abstractmethod
+    def get_prospectos(self) -> list[dict]: ...
+
+    @abstractmethod
+    def crear_prospecto(self, data: dict) -> dict: ...
+
+    @abstractmethod
+    def actualizar_prospecto(self, record_id: str, data: dict) -> dict: ...
