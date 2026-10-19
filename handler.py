@@ -1,11 +1,26 @@
 import json
 import os
 
+import requests as http_requests
+
 from adapters.salesforce import SalesforceAdapter
+from adapters.experenta_crm import ExperentaCRMAdapter
 from secrets_manager import get_credentials
 
 
 MOCK_MODE = os.environ.get("MOCK_MODE", "false").lower() == "true"
+
+
+class TenantNotFoundError(Exception):
+    pass
+
+
+class CRMUnavailableError(Exception):
+    pass
+
+
+class TokenExpiredError(Exception):
+    pass
 
 
 def handler(event, context):
@@ -18,6 +33,7 @@ def handler(event, context):
 
     method = event.get("requestContext", {}).get("http", {}).get("method", "")
     path = event.get("rawPath", "").removeprefix("/prod")
+    qs = event.get("queryStringParameters") or {}
     body = {}
     if event.get("body"):
         try:
@@ -30,8 +46,12 @@ def handler(event, context):
 
     try:
         creds = get_credentials(tenant_id)
+        if not creds:
+            raise TenantNotFoundError(f"Tenant '{tenant_id}' no encontrado")
         crm_type = creds.get("crm_type", "salesforce")
         adapter = _get_adapter(crm_type, creds)
+    except TenantNotFoundError as e:
+        return _error(404, str(e))
     except Exception as e:
         return _error(500, f"Error cargando credenciales: {e}")
 
@@ -80,6 +100,21 @@ def handler(event, context):
 
         return _error(404, "Ruta no encontrada")
 
+    except http_requests.exceptions.ConnectionError:
+        return _error(503, "CRM no disponible. Intenta de nuevo más tarde.")
+    except http_requests.exceptions.Timeout:
+        return _error(504, "CRM no respondió a tiempo. Intenta de nuevo.")
+    except http_requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 0
+        if status == 401:
+            return _error(401, "Token de CRM expirado o inválido.")
+        return _error(502, f"Error del CRM: {status}")
+    except NotImplementedError as e:
+        return _error(501, str(e))
+    except ValueError as e:
+        msg = str(e)
+        code = 400 if msg.startswith("ID inválido") or msg.startswith("Campo requerido") else 404
+        return _error(code, msg)
     except Exception as e:
         return _error(500, str(e))
 
@@ -117,6 +152,8 @@ def _handle_mock(method: str, path: str, body: dict, tenant_id: str, app_id: str
 def _get_adapter(crm_type: str, creds: dict):
     if crm_type == "salesforce":
         return SalesforceAdapter(creds)
+    if crm_type == "experenta_crm":
+        return ExperentaCRMAdapter(creds)
     raise ValueError(f"CRM no soportado: {crm_type}")
 
 

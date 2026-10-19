@@ -4,3 +4,23 @@ __pycache__/
 venv/
 .venv/
 *.zip
+
+# Dependencias instaladas localmente (usar requirements.txt)
+certifi/
+certifi-*.dist-info/
+charset_normalizer/
+charset_normalizer-*.dist-info/
+idna/
+idna-*.dist-info/
+requests/
+requests-*.dist-info/
+urllib3/
+urllib3-*.dist-info/
+package/
+bin/
+
+# Archivos de prueba locales
+payload*.json
+out*.json
+response*.json
+test_*.py
