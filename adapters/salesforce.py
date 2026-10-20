@@ -20,7 +20,7 @@ class SalesforceAdapter(CRMAdapter):
     # ── Clientes ──────────────────────────────────────────────────────────────
 
     _CLIENTE_FIELDS = (
-        "Id, Name, Phone, Id_Externo__c, ParentId, "
+        "Id, Name, Nombre_de_negocio__c, Phone, Id_Externo__c, ParentId, "
         "ShippingStreet, ShippingCity, ShippingState, ShippingPostalCode, ShippingCountry, "
         "ShippingLatitude, ShippingLongitude, "
         "Dias_de_visita__c"
@@ -57,11 +57,12 @@ class SalesforceAdapter(CRMAdapter):
         dias = [d.strip() for d in dias_raw.split(";")] if dias_raw else []
 
         return {
-            "id":          r["Id"],
-            "id_externo":  r.get("Id_Externo__c"),
-            "parent_id":   r.get("ParentId"),
-            "nombre":      r.get("Name"),
-            "tel":         r.get("Phone"),
+            "id":              r["Id"],
+            "id_externo":      r.get("Id_Externo__c"),
+            "parent_id":       r.get("ParentId"),
+            "nombre":          r.get("Name"),
+            "nombre_negocio":  r.get("Nombre_de_negocio__c"),
+            "tel":             r.get("Phone"),
             "direccion":   direccion,
             "lat":         r.get("ShippingLatitude"),
             "lng":         r.get("ShippingLongitude"),
