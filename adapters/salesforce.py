@@ -19,13 +19,24 @@ class SalesforceAdapter(CRMAdapter):
 
     # ── Clientes ──────────────────────────────────────────────────────────────
 
+    _CLIENTE_FIELDS = (
+        "Id, Name, Phone, Id_Externo__c, ParentId, "
+        "ShippingStreet, ShippingCity, ShippingState, ShippingPostalCode, ShippingCountry, "
+        "ShippingLatitude, ShippingLongitude, "
+        "Dias_de_visita__c"
+    )
+
     def get_clientes(self) -> list[dict]:
-        records = self.sf.query_all("SELECT Id, Name, Phone FROM Account ORDER BY Name")
+        records = self.sf.query_all(
+            f"SELECT {self._CLIENTE_FIELDS} FROM Account "
+            f"WHERE Activo__c = true ORDER BY Name"
+        )
         return [self._cliente(r) for r in records]
 
     def get_cliente(self, record_id: str) -> dict:
         data = self.sf.query(
-            f"SELECT Id, Name, Phone FROM Account WHERE Id = '{_safe_id(record_id)}' LIMIT 1"
+            f"SELECT {self._CLIENTE_FIELDS} FROM Account "
+            f"WHERE Id = '{_safe_id(record_id)}' AND Activo__c = true LIMIT 1"
         )
         records = data.get("records", [])
         if not records:
@@ -33,10 +44,28 @@ class SalesforceAdapter(CRMAdapter):
         return self._cliente(records[0])
 
     def _cliente(self, r: dict) -> dict:
+        partes = [
+            r.get("ShippingStreet"),
+            r.get("ShippingCity"),
+            r.get("ShippingState"),
+            r.get("ShippingPostalCode"),
+            r.get("ShippingCountry"),
+        ]
+        direccion = ", ".join(p for p in partes if p) or None
+
+        dias_raw = r.get("Dias_de_visita__c")
+        dias = [d.strip() for d in dias_raw.split(";")] if dias_raw else []
+
         return {
-            "id":     r["Id"],
-            "nombre": r.get("Name"),
-            "tel":    r.get("Phone"),
+            "id":          r["Id"],
+            "id_externo":  r.get("Id_Externo__c"),
+            "parent_id":   r.get("ParentId"),
+            "nombre":      r.get("Name"),
+            "tel":         r.get("Phone"),
+            "direccion":   direccion,
+            "lat":         r.get("ShippingLatitude"),
+            "lng":         r.get("ShippingLongitude"),
+            "dias_visita": dias,
         }
 
     # ── Pedidos ───────────────────────────────────────────────────────────────
