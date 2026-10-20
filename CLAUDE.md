@@ -84,9 +84,11 @@ Para `experenta_crm`:
 
 ```bash
 pip install -r requirements.txt -t package/
-zip -r function.zip handler.py sf_client.py secrets_manager.py adapters/ package/
-aws lambda update-function-code --function-name nugo-standard-middleware --zip-file fileb://function.zip
+python build_zip.py
+aws lambda update-function-code --function-name nugo-standard-middleware --zip-file fileb://function.zip --region us-east-2
 ```
+
+`build_zip.py` construye el ZIP correctamente: incluye `adapters/` desde el código fuente y aplana `package/` en la raíz, evitando que dependencias antiguas en `package/` sobreescriban el código propio.
 
 ## Variables de entorno Lambda
 
