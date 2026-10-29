@@ -81,15 +81,17 @@ Para `experenta_crm`:
 
 ### Visitas (Salesforce `Event`)
 
-El vendedor se identifica por el claim `custom:vendedor_id` de su ID token de Cognito (Id del `User` de Salesforce, que el app client no debe poder escribir). Si el token no lo trae, el adapter busca el `User` activo de Salesforce con el `Email` del claim `email`. Ese Id es el `OwnerId`. Un vendedor solo ve y marca sus propios Events. Un día se calcula con el `utc_offset` del secreto del tenant (default `-06:00`, Honduras).
+El vendedor se identifica solo por el claim `custom:vendedor_id` de su ID token de Cognito (Id del `User` de Salesforce, que el app client no debe poder escribir). Nunca por email: sin ese claim responde 403.
 
-Solo se usan campos estándar del `Event`, sin campos custom:
+Las visitas se traen por módulo: el adapter busca los `Modulo__c` con `Vendedor__c` = vendedor y devuelve los Events cuyo `WhatId` es un Account con `Account.Modulo__c` en esos módulos, sin importar el `OwnerId`. Un vendedor solo ve y marca las visitas de su módulo; sin módulo asignado responde 403. Un día se calcula con el `utc_offset` del secreto del tenant (default `-06:00`, Honduras).
+
+Objetos custom: `Modulo__c` (`Vendedor__c` → User) y `Account.Modulo__c` → Modulo__c. Del `Event` solo se usan campos estándar:
 
 | Campo | Uso |
 |-------|-----|
-| `OwnerId` | Vendedor |
-| `WhatId` | Cliente (Account). Solo los Events relacionados con un Account son visitas |
-| `Type` | Estado: `completada` o `sin_compra`. Cualquier otro valor o vacío = `pendiente`. El picklist necesita esos dos valores |
+| `OwnerId` | Asignado a (informativo; no filtra) |
+| `WhatId` | Cliente (Account). Solo los Events relacionados con un Account de un módulo son visitas |
+| `Type` | Estado: nombres API `completada` o `sin_compra`. Cualquier otro valor (p. ej. `pendiente`) o vacío = `pendiente` |
 | `StartDateTime` | Programado hasta el check in; el check in lo reemplaza por la hora real de llegada |
 | `EndDateTime` | Igual que el campo de inicio; el check out lo reemplaza por la hora real de salida. Al hacer check in queda igual a `StartDateTime` (Salesforce exige fin >= inicio) |
 | `Location` | Coordenadas, escritas por el Middleware: `check_in: lat,lng \| check_out: lat,lng`. Su presencia indica que hubo check in/out |

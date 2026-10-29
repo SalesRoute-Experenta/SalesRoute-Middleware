@@ -5,7 +5,6 @@ from adapters.base import CRMAdapter
 from sf_client import SalesforceClient
 
 _SF_ID_RE = re.compile(r'^[a-zA-Z0-9]{15,18}$')
-_EMAIL_RE = re.compile(r"^[^@\s'\\]+@[^@\s'\\]+\.[^@\s'\\]+$")
 _OFFSET_RE = re.compile(r'^([+-])(\d{2}):(\d{2})$')
 
 # Honduras no usa horario de verano; un tenant en otra zona lo define con "utc_offset" en su secreto.
@@ -378,28 +377,27 @@ class SalesforceAdapter(CRMAdapter):
 
     # Solo campos estándar del Event: WhatId = cliente (Account), Type = estado,
     # StartDateTime/EndDateTime = hora real de check in/out, Location = coordenadas.
+    # Las visitas del vendedor son los Events de las cuentas de su módulo (Account.Modulo__c).
     _VISITA_FIELDS = "Id, OwnerId, WhatId, What.Name, Type, StartDateTime, EndDateTime, Location"
-    _ES_VISITA = "What.Type = 'Account'"
 
-    def get_visitas(self, vendedor: dict, fecha: str | None) -> list[dict]:
-        owner_id = self._vendedor_id(vendedor)
+    def get_visitas(self, vendedor_id: str | None, fecha: str | None) -> list[dict]:
+        cartera = self._cartera(vendedor_id)
         dia = self._dia(fecha)
         desde = datetime.combine(dia, datetime.min.time(), self.zona)
         hasta = desde + timedelta(days=1)
         records = self.sf.query_all(
             f"SELECT {self._VISITA_FIELDS} FROM Event "
-            f"WHERE OwnerId = '{owner_id}' AND {self._ES_VISITA} "
+            f"WHERE {cartera} "
             f"AND StartDateTime >= {desde.isoformat()} AND StartDateTime < {hasta.isoformat()} "
             f"ORDER BY StartDateTime"
         )
         return [self._visita(r) for r in records]
 
-    def get_visita(self, vendedor: dict, record_id: str) -> dict:
-        return self._visita(self._evento(self._vendedor_id(vendedor), record_id), detalle=True)
+    def get_visita(self, vendedor_id: str | None, record_id: str) -> dict:
+        return self._visita(self._evento(self._cartera(vendedor_id), record_id), detalle=True)
 
-    def actualizar_visita(self, vendedor: dict, record_id: str, data: dict) -> dict:
-        owner_id = self._vendedor_id(vendedor)
-        evento = self._evento(owner_id, record_id)
+    def actualizar_visita(self, vendedor_id: str | None, record_id: str, data: dict) -> dict:
+        evento = self._evento(self._cartera(vendedor_id), record_id)
         check_in = "fecha_inicio" in data
         check_out = "fecha_fin" in data
         if not check_in and not check_out:
@@ -433,28 +431,25 @@ class SalesforceAdapter(CRMAdapter):
 
         payload["Location"] = _location(ubicaciones)
         self.sf.update("Event", evento["Id"], payload)
-        return self.get_visita(vendedor, record_id)
+        return self.get_visita(vendedor_id, record_id)
 
-    def _vendedor_id(self, vendedor: dict) -> str:
-        # custom:vendedor_id del token es el Id del User; sin él, se busca el User por email.
-        if vendedor.get("id"):
-            return _safe_id(vendedor["id"])
-        email = vendedor.get("email")
-        if not email or not _EMAIL_RE.match(email):
-            raise PermissionError("El token no trae el email del vendedor")
-        data = self.sf.query(
-            f"SELECT Id FROM User WHERE Email = '{email}' AND IsActive = true LIMIT 2"
-        )
-        records = data.get("records", [])
-        if len(records) != 1:
-            raise PermissionError(f"El vendedor {email} no tiene un usuario activo único en Salesforce")
-        return records[0]["Id"]
+    def _cartera(self, vendedor_id: str | None) -> str:
+        # Filtro SOQL de los Events de las cuentas de los módulos del vendedor.
+        # SOQL no anida semi-joins, por eso los módulos se consultan aparte.
+        if not vendedor_id:
+            raise PermissionError("El token no trae custom:vendedor_id")
+        vendedor_id = _safe_id(vendedor_id)
+        data = self.sf.query(f"SELECT Id FROM Modulo__c WHERE Vendedor__c = '{vendedor_id}'")
+        modulos = [f"'{_safe_id(r['Id'])}'" for r in data.get("records", [])]
+        if not modulos:
+            raise PermissionError(f"El vendedor {vendedor_id} no tiene módulo asignado")
+        return f"WhatId IN (SELECT Id FROM Account WHERE Modulo__c IN ({', '.join(modulos)}))"
 
-    def _evento(self, owner_id: str, record_id: str) -> dict:
-        # Filtrar por OwnerId: un vendedor solo ve y marca sus propias visitas.
+    def _evento(self, cartera: str, record_id: str) -> dict:
+        # Un vendedor solo ve y marca las visitas de su módulo.
         data = self.sf.query(
             f"SELECT {self._VISITA_FIELDS} FROM Event "
-            f"WHERE Id = '{_safe_id(record_id)}' AND OwnerId = '{owner_id}' AND {self._ES_VISITA} LIMIT 1"
+            f"WHERE Id = '{_safe_id(record_id)}' AND {cartera} LIMIT 1"
         )
         records = data.get("records", [])
         if not records:
