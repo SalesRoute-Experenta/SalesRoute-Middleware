@@ -83,16 +83,16 @@ Para `experenta_crm`:
 
 El vendedor se identifica por el claim `email` de su ID token de Cognito: el adapter busca el `User` activo de Salesforce con ese `Email` y usa su Id como `OwnerId`. Un vendedor solo ve y marca sus propios Events. Un día se calcula con el `utc_offset` del secreto del tenant (default `-06:00`, Honduras).
 
-Campos del `Event` (los custom deben existir en la org del tenant):
+Solo se usan campos estándar del `Event`, sin campos custom:
 
-| Campo | Tipo | Uso |
-|-------|------|-----|
-| `OwnerId` | Lookup User | Vendedor |
-| `StartDateTime` | DateTime | Día y hora programados |
-| `Cliente__c` | Lookup Account | Cliente a visitar; Events sin cliente no son visitas |
-| `Estado__c` | Picklist `pendiente` / `completada` / `sin_compra` | Vacío = `pendiente` |
-| `Check_in__c`, `Check_out__c` | DateTime | Hora real de llegada y salida |
-| `Check_in_Ubicacion__c`, `Check_out_Ubicacion__c` | Geolocation | Coordenadas de llegada y salida |
+| Campo | Uso |
+|-------|-----|
+| `OwnerId` | Vendedor |
+| `WhatId` | Cliente (Account). Solo los Events relacionados con un Account son visitas |
+| `Type` | Estado: `completada` o `sin_compra`. Cualquier otro valor o vacío = `pendiente`. El picklist necesita esos dos valores |
+| `StartDateTime` | Programado hasta el check in; el check in lo reemplaza por la hora real de llegada |
+| `EndDateTime` | Igual que el campo de inicio; el check out lo reemplaza por la hora real de salida. Al hacer check in queda igual a `StartDateTime` (Salesforce exige fin >= inicio) |
+| `Location` | Coordenadas, escritas por el Middleware: `check_in: lat,lng \| check_out: lat,lng`. Su presencia indica que hubo check in/out |
 
 Body de `PUT /visitas/{id}`:
 - Check in: `{"fecha_inicio", "lat_inicio", "lng_inicio"}`.

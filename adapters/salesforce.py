@@ -52,6 +52,20 @@ def _sf_datetime(ts: datetime) -> str:
     return ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000+0000")
 
 
+# Event.Location guarda las coordenadas: "check_in: 14.081800,-87.206800 | check_out: 14.082100,-87.207100"
+_UBICACION_RE = re.compile(r'(check_in|check_out): (-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)')
+
+def _ubicaciones(location: str | None) -> dict[str, tuple[float, float]]:
+    return {m.group(1): (float(m.group(2)), float(m.group(3))) for m in _UBICACION_RE.finditer(location or "")}
+
+
+def _location(ubicaciones: dict[str, tuple[float, float]]) -> str:
+    return " | ".join(
+        f"{momento}: {ubicaciones[momento][0]:.6f},{ubicaciones[momento][1]:.6f}"
+        for momento in ("check_in", "check_out") if momento in ubicaciones
+    )
+
+
 class SalesforceAdapter(CRMAdapter):
 
     def __init__(self, creds: dict):
@@ -362,11 +376,10 @@ class SalesforceAdapter(CRMAdapter):
 
     # ── Visitas → Event ───────────────────────────────────────────────────────
 
-    _VISITA_FIELDS = (
-        "Id, OwnerId, StartDateTime, Cliente__c, Cliente__r.Name, Estado__c, "
-        "Check_in__c, Check_in_Ubicacion__Latitude__s, Check_in_Ubicacion__Longitude__s, "
-        "Check_out__c, Check_out_Ubicacion__Latitude__s, Check_out_Ubicacion__Longitude__s"
-    )
+    # Solo campos estándar del Event: WhatId = cliente (Account), Type = estado,
+    # StartDateTime/EndDateTime = hora real de check in/out, Location = coordenadas.
+    _VISITA_FIELDS = "Id, OwnerId, WhatId, What.Name, Type, StartDateTime, EndDateTime, Location"
+    _ES_VISITA = "What.Type = 'Account'"
 
     def get_visitas(self, vendedor_email: str | None, fecha: str | None) -> list[dict]:
         owner_id = self._vendedor_id(vendedor_email)
@@ -375,7 +388,7 @@ class SalesforceAdapter(CRMAdapter):
         hasta = desde + timedelta(days=1)
         records = self.sf.query_all(
             f"SELECT {self._VISITA_FIELDS} FROM Event "
-            f"WHERE OwnerId = '{owner_id}' AND Cliente__c != null "
+            f"WHERE OwnerId = '{owner_id}' AND {self._ES_VISITA} "
             f"AND StartDateTime >= {desde.isoformat()} AND StartDateTime < {hasta.isoformat()} "
             f"ORDER BY StartDateTime"
         )
@@ -392,15 +405,18 @@ class SalesforceAdapter(CRMAdapter):
         if not check_in and not check_out:
             raise ValueError("Campo requerido: fecha_inicio (check in) o fecha_fin (check out)")
 
+        ubicaciones = _ubicaciones(evento.get("Location"))
         payload = {}
         inicio = None
         if check_in:
             inicio = _timestamp(data, "fecha_inicio")
-            payload["Check_in__c"] = _sf_datetime(inicio)
-            payload["Check_in_Ubicacion__Latitude__s"] = _coordenada(data, "lat_inicio", 90)
-            payload["Check_in_Ubicacion__Longitude__s"] = _coordenada(data, "lng_inicio", 180)
-        elif evento.get("Check_in__c"):
-            inicio = datetime.fromisoformat(evento["Check_in__c"])
+            ubicaciones["check_in"] = (_coordenada(data, "lat_inicio", 90), _coordenada(data, "lng_inicio", 180))
+            payload["StartDateTime"] = _sf_datetime(inicio)
+            # Salesforce exige EndDateTime >= StartDateTime: hasta el check out la visita dura 0 minutos.
+            fin_actual = datetime.fromisoformat(evento["EndDateTime"]) if "check_out" in ubicaciones else None
+            payload["EndDateTime"] = _sf_datetime(fin_actual if fin_actual and fin_actual >= inicio else inicio)
+        elif "check_in" in ubicaciones:
+            inicio = datetime.fromisoformat(evento["StartDateTime"])
 
         if check_out:
             if inicio is None:
@@ -411,11 +427,11 @@ class SalesforceAdapter(CRMAdapter):
             estado = data.get("estado")
             if estado not in _ESTADOS_CIERRE:
                 raise ValueError("Campo requerido: estado (completada o sin_compra)")
-            payload["Check_out__c"] = _sf_datetime(fin)
-            payload["Check_out_Ubicacion__Latitude__s"] = _coordenada(data, "lat_fin", 90)
-            payload["Check_out_Ubicacion__Longitude__s"] = _coordenada(data, "lng_fin", 180)
-            payload["Estado__c"] = estado
+            ubicaciones["check_out"] = (_coordenada(data, "lat_fin", 90), _coordenada(data, "lng_fin", 180))
+            payload["EndDateTime"] = _sf_datetime(fin)
+            payload["Type"] = estado
 
+        payload["Location"] = _location(ubicaciones)
         self.sf.update("Event", evento["Id"], payload)
         return self.get_visita(vendedor_email, record_id)
 
@@ -434,7 +450,7 @@ class SalesforceAdapter(CRMAdapter):
         # Filtrar por OwnerId: un vendedor solo ve y marca sus propias visitas.
         data = self.sf.query(
             f"SELECT {self._VISITA_FIELDS} FROM Event "
-            f"WHERE Id = '{_safe_id(record_id)}' AND OwnerId = '{owner_id}' AND Cliente__c != null LIMIT 1"
+            f"WHERE Id = '{_safe_id(record_id)}' AND OwnerId = '{owner_id}' AND {self._ES_VISITA} LIMIT 1"
         )
         records = data.get("records", [])
         if not records:
@@ -452,18 +468,22 @@ class SalesforceAdapter(CRMAdapter):
     def _visita(self, r: dict, detalle: bool = False) -> dict:
         visita = {
             "id":             r["Id"],
-            "cliente_id":     r.get("Cliente__c"),
-            "cliente_nombre": (r.get("Cliente__r") or {}).get("Name"),
+            "cliente_id":     r.get("WhatId"),
+            "cliente_nombre": (r.get("What") or {}).get("Name"),
             "vendedor_id":    r.get("OwnerId"),
-            "estado":         r.get("Estado__c") or "pendiente",
+            "estado":         r.get("Type") if r.get("Type") in _ESTADOS_CIERRE else "pendiente",
         }
         if detalle:
+            # Antes del check in, StartDateTime/EndDateTime son el horario programado, no la hora real.
+            ubicaciones = _ubicaciones(r.get("Location"))
+            lat_inicio, lng_inicio = ubicaciones.get("check_in", (None, None))
+            lat_fin, lng_fin = ubicaciones.get("check_out", (None, None))
             visita.update({
-                "fecha_inicio": r.get("Check_in__c"),
-                "lat_inicio":   r.get("Check_in_Ubicacion__Latitude__s"),
-                "lng_inicio":   r.get("Check_in_Ubicacion__Longitude__s"),
-                "fecha_fin":    r.get("Check_out__c"),
-                "lat_fin":      r.get("Check_out_Ubicacion__Latitude__s"),
-                "lng_fin":      r.get("Check_out_Ubicacion__Longitude__s"),
+                "fecha_inicio": r.get("StartDateTime") if "check_in" in ubicaciones else None,
+                "lat_inicio":   lat_inicio,
+                "lng_inicio":   lng_inicio,
+                "fecha_fin":    r.get("EndDateTime") if "check_out" in ubicaciones else None,
+                "lat_fin":      lat_fin,
+                "lng_fin":      lng_fin,
             })
         return visita
