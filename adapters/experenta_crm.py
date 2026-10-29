@@ -168,11 +168,11 @@ class ExperentaCRMAdapter(CRMAdapter):
     def get_promos(self) -> list[dict]:
         raise NotImplementedError("Promos: pendiente en CRM Experenta")
 
-    def get_visitas(self, vendedor_email: str | None, fecha: str | None) -> list[dict]:
+    def get_visitas(self, vendedor: dict, fecha: str | None) -> list[dict]:
         raise NotImplementedError("Visitas: pendiente en CRM Experenta")
 
-    def get_visita(self, vendedor_email: str | None, record_id: str) -> dict:
+    def get_visita(self, vendedor: dict, record_id: str) -> dict:
         raise NotImplementedError("Visitas: pendiente en CRM Experenta")
 
-    def actualizar_visita(self, vendedor_email: str | None, record_id: str, data: dict) -> dict:
+    def actualizar_visita(self, vendedor: dict, record_id: str, data: dict) -> dict:
         raise NotImplementedError("Visitas: pendiente en CRM Experenta")

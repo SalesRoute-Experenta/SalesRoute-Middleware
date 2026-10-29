@@ -56,7 +56,7 @@ Para `experenta_crm`:
 2. Implementar todos los métodos abstractos. Los no disponibles lanzan `NotImplementedError`.
 3. Registrar en `handler.py` → función `_get_adapter()`.
 4. Crear secreto en Secrets Manager con `crm_type` correspondiente.
-5. Crear usuario Cognito con `custom:tenant_id` = nombre del secreto.
+5. Crear usuario Cognito con `custom:tenant_id` = nombre del secreto y `custom:vendedor_id` = Id del vendedor en el CRM.
 
 ## Endpoints
 
@@ -81,7 +81,7 @@ Para `experenta_crm`:
 
 ### Visitas (Salesforce `Event`)
 
-El vendedor se identifica por el claim `email` de su ID token de Cognito: el adapter busca el `User` activo de Salesforce con ese `Email` y usa su Id como `OwnerId`. Un vendedor solo ve y marca sus propios Events. Un día se calcula con el `utc_offset` del secreto del tenant (default `-06:00`, Honduras).
+El vendedor se identifica por el claim `custom:vendedor_id` de su ID token de Cognito (Id del `User` de Salesforce, que el app client no debe poder escribir). Si el token no lo trae, el adapter busca el `User` activo de Salesforce con el `Email` del claim `email`. Ese Id es el `OwnerId`. Un vendedor solo ve y marca sus propios Events. Un día se calcula con el `utc_offset` del secreto del tenant (default `-06:00`, Honduras).
 
 Solo se usan campos estándar del `Event`, sin campos custom:
 

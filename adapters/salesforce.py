@@ -381,8 +381,8 @@ class SalesforceAdapter(CRMAdapter):
     _VISITA_FIELDS = "Id, OwnerId, WhatId, What.Name, Type, StartDateTime, EndDateTime, Location"
     _ES_VISITA = "What.Type = 'Account'"
 
-    def get_visitas(self, vendedor_email: str | None, fecha: str | None) -> list[dict]:
-        owner_id = self._vendedor_id(vendedor_email)
+    def get_visitas(self, vendedor: dict, fecha: str | None) -> list[dict]:
+        owner_id = self._vendedor_id(vendedor)
         dia = self._dia(fecha)
         desde = datetime.combine(dia, datetime.min.time(), self.zona)
         hasta = desde + timedelta(days=1)
@@ -394,11 +394,11 @@ class SalesforceAdapter(CRMAdapter):
         )
         return [self._visita(r) for r in records]
 
-    def get_visita(self, vendedor_email: str | None, record_id: str) -> dict:
-        return self._visita(self._evento(self._vendedor_id(vendedor_email), record_id), detalle=True)
+    def get_visita(self, vendedor: dict, record_id: str) -> dict:
+        return self._visita(self._evento(self._vendedor_id(vendedor), record_id), detalle=True)
 
-    def actualizar_visita(self, vendedor_email: str | None, record_id: str, data: dict) -> dict:
-        owner_id = self._vendedor_id(vendedor_email)
+    def actualizar_visita(self, vendedor: dict, record_id: str, data: dict) -> dict:
+        owner_id = self._vendedor_id(vendedor)
         evento = self._evento(owner_id, record_id)
         check_in = "fecha_inicio" in data
         check_out = "fecha_fin" in data
@@ -433,9 +433,13 @@ class SalesforceAdapter(CRMAdapter):
 
         payload["Location"] = _location(ubicaciones)
         self.sf.update("Event", evento["Id"], payload)
-        return self.get_visita(vendedor_email, record_id)
+        return self.get_visita(vendedor, record_id)
 
-    def _vendedor_id(self, email: str | None) -> str:
+    def _vendedor_id(self, vendedor: dict) -> str:
+        # custom:vendedor_id del token es el Id del User; sin él, se busca el User por email.
+        if vendedor.get("id"):
+            return _safe_id(vendedor["id"])
+        email = vendedor.get("email")
         if not email or not _EMAIL_RE.match(email):
             raise PermissionError("El token no trae el email del vendedor")
         data = self.sf.query(

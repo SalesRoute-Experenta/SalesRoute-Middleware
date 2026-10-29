@@ -18,6 +18,9 @@ class SalesforceClient:
             },
             timeout=10,
         )
+        if not resp.ok:
+            # Salesforce explica el rechazo en error / error_description (sin secretos).
+            print(f"SF auth error {resp.status_code}: {resp.text[:500]}")
         resp.raise_for_status()
         data = resp.json()
         print(f"SF instance_url: {data.get('instance_url')}")

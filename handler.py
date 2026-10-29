@@ -98,16 +98,16 @@ def handler(event, context):
             record_id = path.split("/")[-1]
             return _ok(adapter.actualizar_prospecto(record_id, body))
 
-        # Visitas: el vendedor se identifica por el email de su ID token de Cognito
-        vendedor_email = claims.get("email")
+        # Visitas: el vendedor se identifica por custom:vendedor_id o, si no viene, por el email del ID token
+        vendedor = {"id": claims.get("custom:vendedor_id"), "email": claims.get("email")}
         if path == "/visitas" and method == "GET":
-            return _ok(adapter.get_visitas(vendedor_email, qs.get("fecha")))
+            return _ok(adapter.get_visitas(vendedor, qs.get("fecha")))
         if path.startswith("/visitas/") and method == "GET":
             record_id = path.split("/")[-1]
-            return _ok(adapter.get_visita(vendedor_email, record_id))
+            return _ok(adapter.get_visita(vendedor, record_id))
         if path.startswith("/visitas/") and method in ("PUT", "PATCH"):
             record_id = path.split("/")[-1]
-            return _ok(adapter.actualizar_visita(vendedor_email, record_id, body))
+            return _ok(adapter.actualizar_visita(vendedor, record_id, body))
 
         return _error(404, "Ruta no encontrada")
 
