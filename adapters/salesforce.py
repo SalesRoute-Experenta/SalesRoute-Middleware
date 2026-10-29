@@ -1,9 +1,16 @@
 import re
+from datetime import date, datetime, timedelta, timezone
 
 from adapters.base import CRMAdapter
 from sf_client import SalesforceClient
 
 _SF_ID_RE = re.compile(r'^[a-zA-Z0-9]{15,18}$')
+_EMAIL_RE = re.compile(r"^[^@\s'\\]+@[^@\s'\\]+\.[^@\s'\\]+$")
+_OFFSET_RE = re.compile(r'^([+-])(\d{2}):(\d{2})$')
+
+# Honduras no usa horario de verano; un tenant en otra zona lo define con "utc_offset" en su secreto.
+_UTC_OFFSET_DEFAULT = "-06:00"
+_ESTADOS_CIERRE = ("completada", "sin_compra")
 
 def _safe_id(record_id: str) -> str:
     if not _SF_ID_RE.match(record_id):
@@ -11,10 +18,45 @@ def _safe_id(record_id: str) -> str:
     return record_id
 
 
+def _zona(offset: str) -> timezone:
+    m = _OFFSET_RE.match(offset)
+    if not m:
+        raise ValueError(f"utc_offset inválido en el secreto del tenant: {offset!r}")
+    signo = -1 if m.group(1) == "-" else 1
+    return timezone(signo * timedelta(hours=int(m.group(2)), minutes=int(m.group(3))))
+
+
+def _timestamp(data: dict, campo: str) -> datetime:
+    valor = data.get(campo)
+    if not valor:
+        raise ValueError(f"Campo requerido: {campo}")
+    try:
+        ts = datetime.fromisoformat(valor)
+    except (TypeError, ValueError):
+        ts = None
+    if ts is None or ts.tzinfo is None:
+        raise ValueError(f"Dato inválido: {campo} debe ser ISO 8601 con zona horaria")
+    return ts
+
+
+def _coordenada(data: dict, campo: str, limite: int) -> float:
+    valor = data.get(campo)
+    if valor is None:
+        raise ValueError(f"Campo requerido: {campo}")
+    if isinstance(valor, bool) or not isinstance(valor, (int, float)) or not -limite <= valor <= limite:
+        raise ValueError(f"Dato inválido: {campo} debe ser un número entre -{limite} y {limite}")
+    return float(valor)
+
+
+def _sf_datetime(ts: datetime) -> str:
+    return ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000+0000")
+
+
 class SalesforceAdapter(CRMAdapter):
 
     def __init__(self, creds: dict):
         self.sf = SalesforceClient(creds)
+        self.zona = _zona(creds.get("utc_offset", _UTC_OFFSET_DEFAULT))
         self._pricebook_id_cache: str | None = None
 
     # ── Clientes ──────────────────────────────────────────────────────────────
@@ -71,11 +113,14 @@ class SalesforceAdapter(CRMAdapter):
 
     # ── Pedidos ───────────────────────────────────────────────────────────────
 
-    def get_pedidos(self) -> list[dict]:
-        data = self.sf.query(
-            "SELECT Id, OrderNumber, Status, TotalAmount, AccountId FROM Order ORDER BY CreatedDate DESC"
+    def get_pedidos(self, cliente_id: str | None = None) -> list[dict]:
+        filtro = f"WHERE AccountId = '{_safe_id(cliente_id)}' " if cliente_id else ""
+        records = self.sf.query_all(
+            "SELECT Id, OrderNumber, Status, TotalAmount, AccountId, "
+            "(SELECT Product2Id, Product2.Name, Quantity, UnitPrice, TotalPrice FROM OrderItems) "
+            f"FROM Order {filtro}ORDER BY CreatedDate DESC"
         )
-        return [self._pedido(r) for r in data.get("records", [])]
+        return [self._pedido(r) for r in records]
 
     def crear_pedido(self, data: dict) -> dict:
         from datetime import date
@@ -146,12 +191,23 @@ class SalesforceAdapter(CRMAdapter):
         return {"id": record_id, "updated": True}
 
     def _pedido(self, r: dict) -> dict:
+        items = (r.get("OrderItems") or {}).get("records", [])
         return {
             "id":         r["Id"],
             "numero":     r.get("OrderNumber"),
             "estado":     r.get("Status"),
             "total":      r.get("TotalAmount"),
             "cliente_id": r.get("AccountId"),
+            "lineas": [
+                {
+                    "producto_id":     i.get("Product2Id"),
+                    "producto_nombre": (i.get("Product2") or {}).get("Name"),
+                    "cantidad":        i.get("Quantity"),
+                    "precio_unitario": i.get("UnitPrice"),
+                    "total":           i.get("TotalPrice"),
+                }
+                for i in items
+            ],
         }
 
     # ── Productos ─────────────────────────────────────────────────────────────
@@ -303,3 +359,111 @@ class SalesforceAdapter(CRMAdapter):
             "email":   r.get("Email"),
             "estado":  r.get("Status"),
         }
+
+    # ── Visitas → Event ───────────────────────────────────────────────────────
+
+    _VISITA_FIELDS = (
+        "Id, OwnerId, StartDateTime, Cliente__c, Cliente__r.Name, Estado__c, "
+        "Check_in__c, Check_in_Ubicacion__Latitude__s, Check_in_Ubicacion__Longitude__s, "
+        "Check_out__c, Check_out_Ubicacion__Latitude__s, Check_out_Ubicacion__Longitude__s"
+    )
+
+    def get_visitas(self, vendedor_email: str | None, fecha: str | None) -> list[dict]:
+        owner_id = self._vendedor_id(vendedor_email)
+        dia = self._dia(fecha)
+        desde = datetime.combine(dia, datetime.min.time(), self.zona)
+        hasta = desde + timedelta(days=1)
+        records = self.sf.query_all(
+            f"SELECT {self._VISITA_FIELDS} FROM Event "
+            f"WHERE OwnerId = '{owner_id}' AND Cliente__c != null "
+            f"AND StartDateTime >= {desde.isoformat()} AND StartDateTime < {hasta.isoformat()} "
+            f"ORDER BY StartDateTime"
+        )
+        return [self._visita(r) for r in records]
+
+    def get_visita(self, vendedor_email: str | None, record_id: str) -> dict:
+        return self._visita(self._evento(self._vendedor_id(vendedor_email), record_id), detalle=True)
+
+    def actualizar_visita(self, vendedor_email: str | None, record_id: str, data: dict) -> dict:
+        owner_id = self._vendedor_id(vendedor_email)
+        evento = self._evento(owner_id, record_id)
+        check_in = "fecha_inicio" in data
+        check_out = "fecha_fin" in data
+        if not check_in and not check_out:
+            raise ValueError("Campo requerido: fecha_inicio (check in) o fecha_fin (check out)")
+
+        payload = {}
+        inicio = None
+        if check_in:
+            inicio = _timestamp(data, "fecha_inicio")
+            payload["Check_in__c"] = _sf_datetime(inicio)
+            payload["Check_in_Ubicacion__Latitude__s"] = _coordenada(data, "lat_inicio", 90)
+            payload["Check_in_Ubicacion__Longitude__s"] = _coordenada(data, "lng_inicio", 180)
+        elif evento.get("Check_in__c"):
+            inicio = datetime.fromisoformat(evento["Check_in__c"])
+
+        if check_out:
+            if inicio is None:
+                raise ValueError("Dato inválido: la visita no tiene check in")
+            fin = _timestamp(data, "fecha_fin")
+            if fin < inicio:
+                raise ValueError("Dato inválido: fecha_fin es anterior a fecha_inicio")
+            estado = data.get("estado")
+            if estado not in _ESTADOS_CIERRE:
+                raise ValueError("Campo requerido: estado (completada o sin_compra)")
+            payload["Check_out__c"] = _sf_datetime(fin)
+            payload["Check_out_Ubicacion__Latitude__s"] = _coordenada(data, "lat_fin", 90)
+            payload["Check_out_Ubicacion__Longitude__s"] = _coordenada(data, "lng_fin", 180)
+            payload["Estado__c"] = estado
+
+        self.sf.update("Event", evento["Id"], payload)
+        return self.get_visita(vendedor_email, record_id)
+
+    def _vendedor_id(self, email: str | None) -> str:
+        if not email or not _EMAIL_RE.match(email):
+            raise PermissionError("El token no trae el email del vendedor")
+        data = self.sf.query(
+            f"SELECT Id FROM User WHERE Email = '{email}' AND IsActive = true LIMIT 2"
+        )
+        records = data.get("records", [])
+        if len(records) != 1:
+            raise PermissionError(f"El vendedor {email} no tiene un usuario activo único en Salesforce")
+        return records[0]["Id"]
+
+    def _evento(self, owner_id: str, record_id: str) -> dict:
+        # Filtrar por OwnerId: un vendedor solo ve y marca sus propias visitas.
+        data = self.sf.query(
+            f"SELECT {self._VISITA_FIELDS} FROM Event "
+            f"WHERE Id = '{_safe_id(record_id)}' AND OwnerId = '{owner_id}' AND Cliente__c != null LIMIT 1"
+        )
+        records = data.get("records", [])
+        if not records:
+            raise ValueError(f"Visita {record_id} no encontrada")
+        return records[0]
+
+    def _dia(self, fecha: str | None) -> date:
+        if not fecha:
+            return datetime.now(self.zona).date()
+        try:
+            return date.fromisoformat(fecha)
+        except ValueError:
+            raise ValueError(f"Dato inválido: fecha debe tener formato YYYY-MM-DD: {fecha!r}")
+
+    def _visita(self, r: dict, detalle: bool = False) -> dict:
+        visita = {
+            "id":             r["Id"],
+            "cliente_id":     r.get("Cliente__c"),
+            "cliente_nombre": (r.get("Cliente__r") or {}).get("Name"),
+            "vendedor_id":    r.get("OwnerId"),
+            "estado":         r.get("Estado__c") or "pendiente",
+        }
+        if detalle:
+            visita.update({
+                "fecha_inicio": r.get("Check_in__c"),
+                "lat_inicio":   r.get("Check_in_Ubicacion__Latitude__s"),
+                "lng_inicio":   r.get("Check_in_Ubicacion__Longitude__s"),
+                "fecha_fin":    r.get("Check_out__c"),
+                "lat_fin":      r.get("Check_out_Ubicacion__Latitude__s"),
+                "lng_fin":      r.get("Check_out_Ubicacion__Longitude__s"),
+            })
+        return visita

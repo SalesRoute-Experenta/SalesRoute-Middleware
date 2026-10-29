@@ -65,7 +65,7 @@ def handler(event, context):
 
         # Pedidos
         if path == "/pedidos" and method == "GET":
-            return _ok(adapter.get_pedidos())
+            return _ok(adapter.get_pedidos(qs.get("cliente_id")))
         if path == "/pedidos" and method == "POST":
             return _ok(adapter.crear_pedido(body))
         if path.startswith("/pedidos/") and method == "PUT":
@@ -98,6 +98,17 @@ def handler(event, context):
             record_id = path.split("/")[-1]
             return _ok(adapter.actualizar_prospecto(record_id, body))
 
+        # Visitas: el vendedor se identifica por el email de su ID token de Cognito
+        vendedor_email = claims.get("email")
+        if path == "/visitas" and method == "GET":
+            return _ok(adapter.get_visitas(vendedor_email, qs.get("fecha")))
+        if path.startswith("/visitas/") and method == "GET":
+            record_id = path.split("/")[-1]
+            return _ok(adapter.get_visita(vendedor_email, record_id))
+        if path.startswith("/visitas/") and method in ("PUT", "PATCH"):
+            record_id = path.split("/")[-1]
+            return _ok(adapter.actualizar_visita(vendedor_email, record_id, body))
+
         return _error(404, "Ruta no encontrada")
 
     except http_requests.exceptions.ConnectionError:
@@ -111,9 +122,11 @@ def handler(event, context):
         return _error(502, f"Error del CRM: {status}")
     except NotImplementedError as e:
         return _error(501, str(e))
+    except PermissionError as e:
+        return _error(403, str(e))
     except ValueError as e:
         msg = str(e)
-        code = 400 if msg.startswith("ID inválido") or msg.startswith("Campo requerido") else 404
+        code = 400 if msg.startswith(("ID inválido", "Campo requerido", "Dato inválido")) else 404
         return _error(code, msg)
     except Exception as e:
         return _error(500, str(e))
@@ -133,7 +146,21 @@ def _handle_mock(method: str, path: str, body: dict, tenant_id: str, app_id: str
             {"id": "prod-002", "nombre": "Producto B", "precio": 85.50, "categoria": "Alimentos"},
         ])
     if path == "/pedidos" and method == "GET":
-        return _ok([{"id": "ped-001", "cliente_id": "mock-001", "total": 1500.00, "estado": "Pendiente"}])
+        return _ok([{
+            "id": "ped-001", "cliente_id": "mock-001", "total": 1500.00, "estado": "Pendiente",
+            "lineas": [{"producto_id": "prod-001", "producto_nombre": "Producto A", "cantidad": 10,
+                        "precio_unitario": 150.00, "total": 1500.00}],
+        }])
+    if path == "/visitas" and method == "GET":
+        return _ok([
+            {"id": "vis-001", "cliente_id": "mock-001", "cliente_nombre": "Cliente Demo SA",
+             "vendedor_id": "ven-001", "estado": "pendiente"},
+            {"id": "vis-002", "cliente_id": "mock-002", "cliente_nombre": "Distribuidora Prueba",
+             "vendedor_id": "ven-001", "estado": "pendiente"},
+        ])
+    if path.startswith("/visitas/") and method in ("PUT", "PATCH"):
+        return _ok({"id": path.split("/")[-1], "vendedor_id": "ven-001",
+                    "estado": body.get("estado", "pendiente"), **body})
     if path == "/pedidos" and method == "POST":
         return _ok({"id": "ped-new-001", "estado": "Creado", **body})
     if path == "/promos" and method == "GET":

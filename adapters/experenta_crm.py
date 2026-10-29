@@ -128,9 +128,12 @@ class ExperentaCRMAdapter(CRMAdapter):
 
     # ── Pedidos → Cotizaciones ────────────────────────────────────────────────
 
-    def get_pedidos(self) -> list[dict]:
+    def get_pedidos(self, cliente_id: str | None = None) -> list[dict]:
         result = self._call("buscar_cotizaciones", {"limit": 200})
-        return [self._pedido(r) for r in result.get("data", [])]
+        pedidos = [self._pedido(r) for r in result.get("data", [])]
+        if cliente_id:
+            pedidos = [p for p in pedidos if p["cliente_id"] == cliente_id]
+        return pedidos
 
     def crear_pedido(self, data: dict) -> dict:
         raise NotImplementedError("Crear pedido: pendiente en MCP")
@@ -145,6 +148,7 @@ class ExperentaCRMAdapter(CRMAdapter):
             "estado":     r.get("status"),
             "total":      r.get("amount"),
             "cliente_id": r.get("account_id"),
+            "lineas":     [],
         }
 
     # ── Pendientes Fase 2 (objetos aún no en CRM) ─────────────────────────────
@@ -163,3 +167,12 @@ class ExperentaCRMAdapter(CRMAdapter):
 
     def get_promos(self) -> list[dict]:
         raise NotImplementedError("Promos: pendiente en CRM Experenta")
+
+    def get_visitas(self, vendedor_email: str | None, fecha: str | None) -> list[dict]:
+        raise NotImplementedError("Visitas: pendiente en CRM Experenta")
+
+    def get_visita(self, vendedor_email: str | None, record_id: str) -> dict:
+        raise NotImplementedError("Visitas: pendiente en CRM Experenta")
+
+    def actualizar_visita(self, vendedor_email: str | None, record_id: str, data: dict) -> dict:
+        raise NotImplementedError("Visitas: pendiente en CRM Experenta")
