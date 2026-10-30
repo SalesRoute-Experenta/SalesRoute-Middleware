@@ -91,15 +91,14 @@ class SalesforceAdapter(CRMAdapter):
     def get_clientes(self, vendedor_id: str | None) -> list[dict]:
         records = self.sf.query_all(
             f"SELECT {self._CLIENTE_FIELDS} FROM Account "
-            f"WHERE Activo__c = true AND Modulo__c IN ({self._modulos(vendedor_id)}) ORDER BY Name"
+            f"WHERE {self._cartera(vendedor_id)} ORDER BY Name"
         )
         return [self._cliente(r) for r in records]
 
     def get_cliente(self, vendedor_id: str | None, record_id: str) -> dict:
         data = self.sf.query(
             f"SELECT {self._CLIENTE_FIELDS} FROM Account "
-            f"WHERE Id = '{_safe_id(record_id)}' AND Activo__c = true "
-            f"AND Modulo__c IN ({self._modulos(vendedor_id)}) LIMIT 1"
+            f"WHERE Id = '{_safe_id(record_id)}' AND {self._cartera(vendedor_id)} LIMIT 1"
         )
         records = data.get("records", [])
         if not records:
@@ -385,12 +384,12 @@ class SalesforceAdapter(CRMAdapter):
 
     # Solo campos estándar del Event: WhatId = cliente (Account), Type = estado,
     # StartDateTime/EndDateTime = hora real de check in/out, Location = coordenadas.
-    # Las visitas del vendedor son los Events de las cuentas de su módulo (Account.Modulo__c).
+    # Las visitas del vendedor son los Events de los clientes de su cartera (ver _cartera).
     _VISITA_FIELDS = "Id, OwnerId, WhatId, What.Name, Type, StartDateTime, EndDateTime, Location"
 
     # Solo se recopilan las visitas de hoy, en la zona horaria del tenant.
     def get_visitas(self, vendedor_id: str | None) -> list[dict]:
-        cartera = self._cartera(vendedor_id)
+        cartera = self._visitas_cartera(vendedor_id)
         hoy = datetime.now(self.zona).date()
         desde = datetime.combine(hoy, datetime.min.time(), self.zona)
         hasta = desde + timedelta(days=1)
@@ -403,10 +402,10 @@ class SalesforceAdapter(CRMAdapter):
         return [self._visita(r) for r in records]
 
     def get_visita(self, vendedor_id: str | None, record_id: str) -> dict:
-        return self._visita(self._evento(self._cartera(vendedor_id), record_id), detalle=True)
+        return self._visita(self._evento(self._visitas_cartera(vendedor_id), record_id), detalle=True)
 
     def actualizar_visita(self, vendedor_id: str | None, record_id: str, data: dict) -> dict:
-        evento = self._evento(self._cartera(vendedor_id), record_id)
+        evento = self._evento(self._visitas_cartera(vendedor_id), record_id)
         check_in = "fecha_inicio" in data
         check_out = "fecha_fin" in data
         if not check_in and not check_out:
@@ -455,11 +454,15 @@ class SalesforceAdapter(CRMAdapter):
         return ", ".join(modulos)
 
     def _cartera(self, vendedor_id: str | None) -> str:
-        # Filtro SOQL de los Events de las cuentas de los módulos del vendedor.
-        return f"WhatId IN (SELECT Id FROM Account WHERE Modulo__c IN ({self._modulos(vendedor_id)}))"
+        # Filtro SOQL de Account: la cartera del vendedor son las cuentas activas de sus módulos.
+        return f"Activo__c = true AND Modulo__c IN ({self._modulos(vendedor_id)})"
+
+    def _visitas_cartera(self, vendedor_id: str | None) -> str:
+        # Filtro SOQL de Event: las visitas son las de los clientes de la cartera.
+        return f"WhatId IN (SELECT Id FROM Account WHERE {self._cartera(vendedor_id)})"
 
     def _evento(self, cartera: str, record_id: str) -> dict:
-        # Un vendedor solo ve y marca las visitas de su módulo.
+        # Un vendedor solo ve y marca las visitas de los clientes de su cartera.
         data = self.sf.query(
             f"SELECT {self._VISITA_FIELDS} FROM Event "
             f"WHERE Id = '{_safe_id(record_id)}' AND {cartera} LIMIT 1"

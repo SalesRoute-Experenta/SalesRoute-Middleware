@@ -87,7 +87,7 @@ Su cartera son las cuentas activas con `Account.Modulo__c` en alguno de sus mód
 
 ### Visitas (Salesforce `Event`)
 
-Las visitas se traen por módulo: el adapter busca los `Modulo__c` con `Vendedor__c` = vendedor y devuelve los Events cuyo `WhatId` es un Account con `Account.Modulo__c` en esos módulos, sin importar el `OwnerId`. Un vendedor solo ve y marca las visitas de su módulo; sin módulo asignado responde 403. Un día se calcula con el `utc_offset` del secreto del tenant (default `-06:00`, Honduras).
+Las visitas se traen a partir de la cartera: son los Events cuyo `WhatId` es un cliente de la cartera del vendedor (Account activo de sus módulos; el mismo filtro de `/clientes`), sin importar el `OwnerId`. Un vendedor solo ve y marca las visitas de sus clientes. `GET /visitas` trae solo las de hoy, calculado con el `utc_offset` del secreto del tenant (default `-06:00`, Honduras).
 
 Objetos custom: `Modulo__c` (`Vendedor__c` → User) y `Account.Modulo__c` → Modulo__c. Del `Event` solo se usan campos estándar:
 
