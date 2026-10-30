@@ -99,7 +99,7 @@ Objetos custom: `Modulo__c` (`Vendedor__c` → User) y `Account.Modulo__c` → M
 Body de `PUT /visitas/{id}`:
 - Check in: `{"fecha_inicio", "lat_inicio", "lng_inicio"}`.
 - Check out: `{"fecha_fin", "lat_fin", "lng_fin", "estado": "completada" | "sin_compra"}`. Requiere check in previo (o en el mismo body) y `fecha_fin >= fecha_inicio`.
-- Fechas ISO 8601 con zona horaria. `GET /visitas` no devuelve fechas ni coordenadas de check in/out; `GET /visitas/{id}` sí.
+- Fechas ISO 8601 con zona horaria. `GET /visitas` devuelve `fecha_inicio` (null sin check in) para que la app sepa qué visitas están en curso, pero no `fecha_fin` ni coordenadas; `GET /visitas/{id}` devuelve todo.
 
 ## Seguridad
 

@@ -471,20 +471,21 @@ class SalesforceAdapter(CRMAdapter):
             raise ValueError(f"Dato inválido: fecha debe tener formato YYYY-MM-DD: {fecha!r}")
 
     def _visita(self, r: dict, detalle: bool = False) -> dict:
+        # Antes del check in, StartDateTime/EndDateTime son el horario programado, no la hora real.
+        # fecha_inicio va también en la lista para que la app sepa qué visitas están en curso.
+        ubicaciones = _ubicaciones(r.get("Location"))
         visita = {
             "id":             r["Id"],
             "cliente_id":     r.get("WhatId"),
             "cliente_nombre": (r.get("What") or {}).get("Name"),
             "vendedor_id":    r.get("OwnerId"),
             "estado":         _estado(r.get("Type")),
+            "fecha_inicio":   r.get("StartDateTime") if "check_in" in ubicaciones else None,
         }
         if detalle:
-            # Antes del check in, StartDateTime/EndDateTime son el horario programado, no la hora real.
-            ubicaciones = _ubicaciones(r.get("Location"))
             lat_inicio, lng_inicio = ubicaciones.get("check_in", (None, None))
             lat_fin, lng_fin = ubicaciones.get("check_out", (None, None))
             visita.update({
-                "fecha_inicio": r.get("StartDateTime") if "check_in" in ubicaciones else None,
                 "lat_inicio":   lat_inicio,
                 "lng_inicio":   lng_inicio,
                 "fecha_fin":    r.get("EndDateTime") if "check_out" in ubicaciones else None,
