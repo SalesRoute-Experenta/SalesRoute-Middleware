@@ -25,6 +25,12 @@ def _zona(offset: str) -> timezone:
     return timezone(signo * timedelta(hours=int(m.group(2)), minutes=int(m.group(3))))
 
 
+def _estado(tipo: str | None) -> str:
+    # Tolera el valor del picklist Type con mayúsculas o espacios ("Completada", "Sin compra").
+    valor = (tipo or "").strip().lower().replace(" ", "_")
+    return valor if valor in _ESTADOS_CIERRE else "pendiente"
+
+
 def _timestamp(data: dict, campo: str) -> datetime:
     valor = data.get(campo)
     if not valor:
@@ -470,7 +476,7 @@ class SalesforceAdapter(CRMAdapter):
             "cliente_id":     r.get("WhatId"),
             "cliente_nombre": (r.get("What") or {}).get("Name"),
             "vendedor_id":    r.get("OwnerId"),
-            "estado":         r.get("Type") if r.get("Type") in _ESTADOS_CIERRE else "pendiente",
+            "estado":         _estado(r.get("Type")),
         }
         if detalle:
             # Antes del check in, StartDateTime/EndDateTime son el horario programado, no la hora real.
