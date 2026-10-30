@@ -154,9 +154,9 @@ def _handle_mock(method: str, path: str, body: dict, tenant_id: str, app_id: str
     if path == "/visitas" and method == "GET":
         return _ok([
             {"id": "vis-001", "cliente_id": "mock-001", "cliente_nombre": "Cliente Demo SA",
-             "vendedor_id": "ven-001", "estado": "pendiente", "fecha_inicio": None},
+             "vendedor_id": "ven-001", "estado": "pendiente", "fecha_inicio": None, "fecha_fin": None},
             {"id": "vis-002", "cliente_id": "mock-002", "cliente_nombre": "Distribuidora Prueba",
-             "vendedor_id": "ven-001", "estado": "pendiente", "fecha_inicio": None},
+             "vendedor_id": "ven-001", "estado": "pendiente", "fecha_inicio": None, "fecha_fin": None},
         ])
     if path.startswith("/visitas/") and method in ("PUT", "PATCH"):
         return _ok({"id": path.split("/")[-1], "vendedor_id": "ven-001",

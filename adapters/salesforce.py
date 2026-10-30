@@ -472,7 +472,7 @@ class SalesforceAdapter(CRMAdapter):
 
     def _visita(self, r: dict, detalle: bool = False) -> dict:
         # Antes del check in, StartDateTime/EndDateTime son el horario programado, no la hora real.
-        # fecha_inicio va también en la lista para que la app sepa qué visitas están en curso.
+        # Las fechas van también en la lista para que la app sepa qué visitas están en curso o cerradas.
         ubicaciones = _ubicaciones(r.get("Location"))
         visita = {
             "id":             r["Id"],
@@ -481,6 +481,7 @@ class SalesforceAdapter(CRMAdapter):
             "vendedor_id":    r.get("OwnerId"),
             "estado":         _estado(r.get("Type")),
             "fecha_inicio":   r.get("StartDateTime") if "check_in" in ubicaciones else None,
+            "fecha_fin":      r.get("EndDateTime") if "check_out" in ubicaciones else None,
         }
         if detalle:
             lat_inicio, lng_inicio = ubicaciones.get("check_in", (None, None))
@@ -488,7 +489,6 @@ class SalesforceAdapter(CRMAdapter):
             visita.update({
                 "lat_inicio":   lat_inicio,
                 "lng_inicio":   lng_inicio,
-                "fecha_fin":    r.get("EndDateTime") if "check_out" in ubicaciones else None,
                 "lat_fin":      lat_fin,
                 "lng_fin":      lng_fin,
             })
