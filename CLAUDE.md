@@ -62,6 +62,7 @@ Para `experenta_crm`:
 
 | Método | Ruta               | Descripción                  |
 |--------|--------------------|------------------------------|
+| GET    | /perfil            | `vendedor_id` y módulos del vendedor; 403 sin `custom:vendedor_id` o sin módulo. La app lo pide al iniciar sesión |
 | GET    | /clientes          | Clientes activos de los módulos del vendedor |
 | GET    | /clientes/{id}     | Cliente por ID, si es de un módulo del vendedor (404 si no) |
 | GET    | /pedidos           | Lista pedidos con sus líneas; `?cliente_id=` filtra por cliente |

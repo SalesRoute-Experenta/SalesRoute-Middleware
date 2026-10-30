@@ -177,3 +177,6 @@ class ExperentaCRMAdapter(CRMAdapter):
 
     def actualizar_visita(self, vendedor_id: str | None, record_id: str, data: dict) -> dict:
         raise NotImplementedError("Visitas: pendiente en CRM Experenta")
+
+    def get_perfil(self, vendedor_id: str | None) -> dict:
+        raise NotImplementedError("Perfil: pendiente en CRM Experenta")

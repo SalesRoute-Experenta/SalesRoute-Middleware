@@ -449,17 +449,30 @@ class SalesforceAdapter(CRMAdapter):
         self.sf.update("Event", evento["Id"], payload)
         return self.get_visita(vendedor_id, record_id)
 
-    def _modulos(self, vendedor_id: str | None) -> str:
-        # Lista SOQL de los módulos del vendedor, para filtrar sus cuentas.
-        # SOQL no anida semi-joins, por eso los módulos se consultan aparte.
+    # ── Perfil del vendedor ───────────────────────────────────────────────────
+
+    # La app lo pide al iniciar sesión para bloquear usuarios sin vendedor_id o sin módulo.
+    def get_perfil(self, vendedor_id: str | None) -> dict:
+        modulos = self._modulos_registros(vendedor_id)
+        return {
+            "vendedor_id": vendedor_id,
+            "modulos": [{"id": r["Id"], "nombre": r.get("Name")} for r in modulos],
+        }
+
+    def _modulos_registros(self, vendedor_id: str | None) -> list[dict]:
         if not vendedor_id:
             raise PermissionError("El token no trae custom:vendedor_id")
         vendedor_id = _safe_id(vendedor_id)
-        data = self.sf.query(f"SELECT Id FROM Modulo__c WHERE Vendedor__c = '{vendedor_id}'")
-        modulos = [f"'{_safe_id(r['Id'])}'" for r in data.get("records", [])]
+        data = self.sf.query(f"SELECT Id, Name FROM Modulo__c WHERE Vendedor__c = '{vendedor_id}' ORDER BY Name")
+        modulos = data.get("records", [])
         if not modulos:
             raise PermissionError(f"El vendedor {vendedor_id} no tiene módulo asignado")
-        return ", ".join(modulos)
+        return modulos
+
+    def _modulos(self, vendedor_id: str | None) -> str:
+        # Lista SOQL de los módulos del vendedor, para filtrar sus cuentas.
+        # SOQL no anida semi-joins, por eso los módulos se consultan aparte.
+        return ", ".join(f"'{_safe_id(r['Id'])}'" for r in self._modulos_registros(vendedor_id))
 
     def _cartera(self, vendedor_id: str | None) -> str:
         # Filtro SOQL de Account: la cartera del vendedor son las cuentas activas de sus módulos.

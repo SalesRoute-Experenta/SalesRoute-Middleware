@@ -50,3 +50,6 @@ class CRMAdapter(ABC):
 
     @abstractmethod
     def actualizar_visita(self, vendedor_id: str | None, record_id: str, data: dict) -> dict: ...
+
+    @abstractmethod
+    def get_perfil(self, vendedor_id: str | None) -> dict: ...

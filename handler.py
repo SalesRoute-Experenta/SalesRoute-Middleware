@@ -59,6 +59,10 @@ def handler(event, context):
     vendedor_id = claims.get("custom:vendedor_id")
 
     try:
+        # Perfil del vendedor (validación al iniciar sesión)
+        if path == "/perfil" and method == "GET":
+            return _ok(adapter.get_perfil(vendedor_id))
+
         # Clientes
         if path == "/clientes" and method == "GET":
             return _ok(adapter.get_clientes(vendedor_id))
@@ -135,6 +139,8 @@ def handler(event, context):
 
 
 def _handle_mock(method: str, path: str, body: dict, tenant_id: str, app_id: str):
+    if path == "/perfil" and method == "GET":
+        return _ok({"vendedor_id": "ven-001", "modulos": [{"id": "mod-001", "nombre": "Módulo Demo"}]})
     if path == "/clientes" and method == "GET":
         return _ok([
             {"id": "mock-001", "nombre": "Cliente Demo SA", "rfc": "CDM010101AAA", "segmento": "A"},
