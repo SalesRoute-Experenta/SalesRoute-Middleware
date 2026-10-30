@@ -385,9 +385,12 @@ class SalesforceAdapter(CRMAdapter):
     # Solo campos estándar del Event: WhatId = cliente (Account), Type = estado,
     # StartDateTime/EndDateTime = hora real de check in/out, Location = coordenadas.
     # Las visitas del vendedor son los Events de los clientes de su cartera (ver _cartera).
-    _VISITA_FIELDS = "Id, OwnerId, WhatId, What.Name, Type, StartDateTime, EndDateTime, Location"
+    # Se crean de todo el día (IsAllDayEvent); el check in las pasa a Events con hora.
+    _VISITA_FIELDS = "Id, OwnerId, WhatId, What.Name, Type, StartDateTime, EndDateTime, Location, IsAllDayEvent"
 
     # Solo se recopilan las visitas de hoy, en la zona horaria del tenant.
+    # Un Event de todo el día solo tiene fecha (ActivityDate): su StartDateTime es 00:00 UTC,
+    # que en -06:00 cae el día anterior, por eso se filtra por ActivityDate.
     def get_visitas(self, vendedor_id: str | None) -> list[dict]:
         cartera = self._visitas_cartera(vendedor_id)
         hoy = datetime.now(self.zona).date()
@@ -396,7 +399,9 @@ class SalesforceAdapter(CRMAdapter):
         records = self.sf.query_all(
             f"SELECT {self._VISITA_FIELDS} FROM Event "
             f"WHERE {cartera} "
-            f"AND StartDateTime >= {desde.isoformat()} AND StartDateTime < {hasta.isoformat()} "
+            f"AND ((IsAllDayEvent = true AND ActivityDate = {hoy.isoformat()}) "
+            f"OR (IsAllDayEvent = false AND StartDateTime >= {desde.isoformat()} "
+            f"AND StartDateTime < {hasta.isoformat()})) "
             f"ORDER BY StartDateTime"
         )
         return [self._visita(r) for r in records]
@@ -417,6 +422,9 @@ class SalesforceAdapter(CRMAdapter):
         if check_in:
             inicio = _timestamp(data, "fecha_inicio")
             ubicaciones["check_in"] = (_coordenada(data, "lat_inicio", 90), _coordenada(data, "lng_inicio", 180))
+            if evento.get("IsAllDayEvent"):
+                # Un Event de todo el día no guarda horas: el check in lo pasa a Event con hora.
+                payload["IsAllDayEvent"] = False
             payload["StartDateTime"] = _sf_datetime(inicio)
             # Salesforce exige EndDateTime >= StartDateTime: hasta el check out la visita dura 0 minutos.
             fin_actual = datetime.fromisoformat(evento["EndDateTime"]) if "check_out" in ubicaciones else None

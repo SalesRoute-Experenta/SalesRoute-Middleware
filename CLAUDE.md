@@ -96,6 +96,7 @@ Objetos custom: `Modulo__c` (`Vendedor__c` → User) y `Account.Modulo__c` → M
 | `OwnerId` | Asignado a (informativo; no filtra) |
 | `WhatId` | Cliente (Account). Solo los Events relacionados con un Account de un módulo son visitas |
 | `Type` | Estado: nombres API `completada` o `sin_compra`. Cualquier otro valor (p. ej. `pendiente`) o vacío = `pendiente` |
+| `IsAllDayEvent` | Las visitas se crean de todo el día. `GET /visitas` las toma por `ActivityDate` = hoy (su `StartDateTime` es 00:00 UTC, que en -06:00 cae el día anterior). El check in lo pone en `false` para poder guardar horas |
 | `StartDateTime` | Programado hasta el check in; el check in lo reemplaza por la hora real de llegada |
 | `EndDateTime` | Igual que el campo de inicio; el check out lo reemplaza por la hora real de salida. Al hacer check in queda igual a `StartDateTime` (Salesforce exige fin >= inicio) |
 | `Location` | Coordenadas, escritas por el Middleware: `check_in: lat,lng \| check_out: lat,lng`. Su presencia indica que hubo check in/out |
