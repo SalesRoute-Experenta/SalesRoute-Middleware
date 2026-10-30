@@ -87,17 +87,19 @@ class SalesforceAdapter(CRMAdapter):
         "Dias_de_visita__c"
     )
 
-    def get_clientes(self) -> list[dict]:
+    # La cartera del vendedor son las cuentas activas de sus módulos (Account.Modulo__c).
+    def get_clientes(self, vendedor_id: str | None) -> list[dict]:
         records = self.sf.query_all(
             f"SELECT {self._CLIENTE_FIELDS} FROM Account "
-            f"WHERE Activo__c = true ORDER BY Name"
+            f"WHERE Activo__c = true AND Modulo__c IN ({self._modulos(vendedor_id)}) ORDER BY Name"
         )
         return [self._cliente(r) for r in records]
 
-    def get_cliente(self, record_id: str) -> dict:
+    def get_cliente(self, vendedor_id: str | None, record_id: str) -> dict:
         data = self.sf.query(
             f"SELECT {self._CLIENTE_FIELDS} FROM Account "
-            f"WHERE Id = '{_safe_id(record_id)}' AND Activo__c = true LIMIT 1"
+            f"WHERE Id = '{_safe_id(record_id)}' AND Activo__c = true "
+            f"AND Modulo__c IN ({self._modulos(vendedor_id)}) LIMIT 1"
         )
         records = data.get("records", [])
         if not records:
@@ -386,10 +388,11 @@ class SalesforceAdapter(CRMAdapter):
     # Las visitas del vendedor son los Events de las cuentas de su módulo (Account.Modulo__c).
     _VISITA_FIELDS = "Id, OwnerId, WhatId, What.Name, Type, StartDateTime, EndDateTime, Location"
 
-    def get_visitas(self, vendedor_id: str | None, fecha: str | None) -> list[dict]:
+    # Solo se recopilan las visitas de hoy, en la zona horaria del tenant.
+    def get_visitas(self, vendedor_id: str | None) -> list[dict]:
         cartera = self._cartera(vendedor_id)
-        dia = self._dia(fecha)
-        desde = datetime.combine(dia, datetime.min.time(), self.zona)
+        hoy = datetime.now(self.zona).date()
+        desde = datetime.combine(hoy, datetime.min.time(), self.zona)
         hasta = desde + timedelta(days=1)
         records = self.sf.query_all(
             f"SELECT {self._VISITA_FIELDS} FROM Event "
@@ -439,8 +442,8 @@ class SalesforceAdapter(CRMAdapter):
         self.sf.update("Event", evento["Id"], payload)
         return self.get_visita(vendedor_id, record_id)
 
-    def _cartera(self, vendedor_id: str | None) -> str:
-        # Filtro SOQL de los Events de las cuentas de los módulos del vendedor.
+    def _modulos(self, vendedor_id: str | None) -> str:
+        # Lista SOQL de los módulos del vendedor, para filtrar sus cuentas.
         # SOQL no anida semi-joins, por eso los módulos se consultan aparte.
         if not vendedor_id:
             raise PermissionError("El token no trae custom:vendedor_id")
@@ -449,7 +452,11 @@ class SalesforceAdapter(CRMAdapter):
         modulos = [f"'{_safe_id(r['Id'])}'" for r in data.get("records", [])]
         if not modulos:
             raise PermissionError(f"El vendedor {vendedor_id} no tiene módulo asignado")
-        return f"WhatId IN (SELECT Id FROM Account WHERE Modulo__c IN ({', '.join(modulos)}))"
+        return ", ".join(modulos)
+
+    def _cartera(self, vendedor_id: str | None) -> str:
+        # Filtro SOQL de los Events de las cuentas de los módulos del vendedor.
+        return f"WhatId IN (SELECT Id FROM Account WHERE Modulo__c IN ({self._modulos(vendedor_id)}))"
 
     def _evento(self, cartera: str, record_id: str) -> dict:
         # Un vendedor solo ve y marca las visitas de su módulo.
@@ -461,14 +468,6 @@ class SalesforceAdapter(CRMAdapter):
         if not records:
             raise ValueError(f"Visita {record_id} no encontrada")
         return records[0]
-
-    def _dia(self, fecha: str | None) -> date:
-        if not fecha:
-            return datetime.now(self.zona).date()
-        try:
-            return date.fromisoformat(fecha)
-        except ValueError:
-            raise ValueError(f"Dato inválido: fecha debe tener formato YYYY-MM-DD: {fecha!r}")
 
     def _visita(self, r: dict, detalle: bool = False) -> dict:
         # Antes del check in, StartDateTime/EndDateTime son el horario programado, no la hora real.

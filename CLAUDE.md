@@ -62,8 +62,8 @@ Para `experenta_crm`:
 
 | Método | Ruta               | Descripción                  |
 |--------|--------------------|------------------------------|
-| GET    | /clientes          | Lista todos los clientes      |
-| GET    | /clientes/{id}     | Cliente por ID                |
+| GET    | /clientes          | Clientes activos de los módulos del vendedor |
+| GET    | /clientes/{id}     | Cliente por ID, si es de un módulo del vendedor (404 si no) |
 | GET    | /pedidos           | Lista pedidos con sus líneas; `?cliente_id=` filtra por cliente |
 | POST   | /pedidos           | Crear pedido                  |
 | PUT    | /pedidos/{id}      | Actualizar pedido             |
@@ -75,13 +75,17 @@ Para `experenta_crm`:
 | PUT    | /prospectos/{id}   | Actualizar prospecto          |
 | GET    | /solicitudes       | Lista solicitudes             |
 | POST   | /solicitudes       | Crear solicitud               |
-| GET    | /visitas           | Visitas del vendedor; `?fecha=YYYY-MM-DD` (default hoy) |
+| GET    | /visitas           | Visitas de hoy del vendedor (zona horaria del tenant); no acepta otra fecha |
 | GET    | /visitas/{id}      | Detalle con check in / check out |
 | PUT/PATCH | /visitas/{id}   | Check in o check out con coordenadas |
 
-### Visitas (Salesforce `Event`)
+### Cartera del vendedor (clientes y visitas)
 
-El vendedor se identifica solo por el claim `custom:vendedor_id` de su ID token de Cognito (Id del `User` de Salesforce, que el app client no debe poder escribir). Nunca por email: sin ese claim responde 403.
+El vendedor se identifica solo por el claim `custom:vendedor_id` de su ID token de Cognito (Id del `User` de Salesforce, que el app client no debe poder escribir). Nunca por email: sin ese claim, `/clientes` y `/visitas` responden 403.
+
+Su cartera son las cuentas activas con `Account.Modulo__c` en alguno de sus módulos (`Modulo__c.Vendedor__c` = vendedor); sin módulo asignado responde 403. En CRM Experenta no hay módulos y `/clientes` no filtra.
+
+### Visitas (Salesforce `Event`)
 
 Las visitas se traen por módulo: el adapter busca los `Modulo__c` con `Vendedor__c` = vendedor y devuelve los Events cuyo `WhatId` es un Account con `Account.Modulo__c` en esos módulos, sin importar el `OwnerId`. Un vendedor solo ve y marca las visitas de su módulo; sin módulo asignado responde 403. Un día se calcula con el `utc_offset` del secreto del tenant (default `-06:00`, Honduras).
 

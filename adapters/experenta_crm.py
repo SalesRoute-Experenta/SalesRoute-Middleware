@@ -56,7 +56,8 @@ class ExperentaCRMAdapter(CRMAdapter):
 
     # ── Clientes → Cuentas ────────────────────────────────────────────────────
 
-    def get_clientes(self) -> list[dict]:
+    # CRM Experenta no tiene módulos: devuelve todas las cuentas sin filtrar por vendedor.
+    def get_clientes(self, vendedor_id: str | None) -> list[dict]:
         page, all_rows = 1, []
         while True:
             result = self._call("buscar_cuentas", {"page": page, "limit": 200})
@@ -68,7 +69,7 @@ class ExperentaCRMAdapter(CRMAdapter):
             page += 1
         return all_rows
 
-    def get_cliente(self, record_id: str) -> dict:
+    def get_cliente(self, vendedor_id: str | None, record_id: str) -> dict:
         result = self._call("buscar_cuentas", {"search": record_id, "limit": 1})
         rows = result.get("data", [])
         if not rows:
@@ -168,7 +169,7 @@ class ExperentaCRMAdapter(CRMAdapter):
     def get_promos(self) -> list[dict]:
         raise NotImplementedError("Promos: pendiente en CRM Experenta")
 
-    def get_visitas(self, vendedor_id: str | None, fecha: str | None) -> list[dict]:
+    def get_visitas(self, vendedor_id: str | None) -> list[dict]:
         raise NotImplementedError("Visitas: pendiente en CRM Experenta")
 
     def get_visita(self, vendedor_id: str | None, record_id: str) -> dict:

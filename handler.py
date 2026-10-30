@@ -55,13 +55,16 @@ def handler(event, context):
     except Exception as e:
         return _error(500, f"Error cargando credenciales: {e}")
 
+    # Clientes y visitas: el vendedor se identifica por el claim custom:vendedor_id del ID token
+    vendedor_id = claims.get("custom:vendedor_id")
+
     try:
         # Clientes
         if path == "/clientes" and method == "GET":
-            return _ok(adapter.get_clientes())
+            return _ok(adapter.get_clientes(vendedor_id))
         if path.startswith("/clientes/") and method == "GET":
             record_id = path.split("/")[-1]
-            return _ok(adapter.get_cliente(record_id))
+            return _ok(adapter.get_cliente(vendedor_id, record_id))
 
         # Pedidos
         if path == "/pedidos" and method == "GET":
@@ -98,10 +101,9 @@ def handler(event, context):
             record_id = path.split("/")[-1]
             return _ok(adapter.actualizar_prospecto(record_id, body))
 
-        # Visitas: el vendedor se identifica por el claim custom:vendedor_id del ID token
-        vendedor_id = claims.get("custom:vendedor_id")
+        # Visitas
         if path == "/visitas" and method == "GET":
-            return _ok(adapter.get_visitas(vendedor_id, qs.get("fecha")))
+            return _ok(adapter.get_visitas(vendedor_id))
         if path.startswith("/visitas/") and method == "GET":
             record_id = path.split("/")[-1]
             return _ok(adapter.get_visita(vendedor_id, record_id))
