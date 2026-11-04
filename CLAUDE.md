@@ -96,10 +96,14 @@ Objetos custom: `Modulo__c` (`Vendedor__c` → User) y `Account.Modulo__c` → M
 |-------|-----|
 | `OwnerId` | Asignado a (informativo; no filtra) |
 | `WhatId` | Cliente (Account). Solo los Events relacionados con un Account de un módulo son visitas |
-| `Type` | Estado: nombres API `completada` o `sin_compra`. Cualquier otro valor (p. ej. `pendiente`) o vacío = `pendiente` |
+| `Type` | Estado oficial de la visita: `completada` o `sin_compra` (se normalizan mayúsculas y espacios, p. ej. `Completada`). Cualquier otro valor (p. ej. `pendiente`) o vacío = `pendiente`. En Salesforce, reportes y vistas deben filtrar por este campo |
 | `IsAllDayEvent` | Las visitas se crean de todo el día. `GET /visitas` las toma por `ActivityDate` = hoy (su `StartDateTime` es 00:00 UTC, que en -06:00 cae el día anterior). El check in lo pone en `false` para poder guardar horas |
 | `StartDateTime` | Programado hasta el check in; el check in lo reemplaza por la hora real de llegada |
 | `EndDateTime` | Igual que el campo de inicio; el check out lo reemplaza por la hora real de salida. Al hacer check in queda igual a `StartDateTime` (Salesforce exige fin >= inicio) |
+
+`StartDateTime` y `EndDateTime` son obligatorios en `Event`, por lo que siempre traen valor, pero **un `EndDateTime` con valor no indica que la visita se registró**: antes del check out es solo relleno. La visita está registrada o cerrada solo si hay check out (`check_out:` en `Location` y `Type` en `completada` o `sin_compra`). La API refleja esto devolviendo `fecha_inicio` y `fecha_fin` en `null` mientras no haya check in o check out, sin leer `EndDateTime` directamente.
+
+Hora de check in = `StartDateTime`, hora de check out = `EndDateTime` y duración = `EndDateTime` − `StartDateTime` (o `DurationInMinutes`), válidas solo en visitas cerradas. Salesforce las guarda en UTC; la zona del tenant (`utc_offset`) se usa para calcular "hoy" y la app envía las fechas con zona, por lo que no hay desfase.
 | `Location` | Coordenadas, escritas por el Middleware: `check_in: lat,lng \| check_out: lat,lng`. Su presencia indica que hubo check in/out |
 
 Body de `PUT /visitas/{id}`:
