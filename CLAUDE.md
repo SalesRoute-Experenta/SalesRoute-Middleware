@@ -65,7 +65,7 @@ Para `experenta_crm`:
 | GET    | /perfil            | `vendedor_id` y módulos del vendedor; 403 sin `custom:vendedor_id` o sin módulo. La app lo pide al iniciar sesión |
 | GET    | /clientes          | Clientes activos de los módulos del vendedor |
 | GET    | /clientes/{id}     | Cliente por ID, si es de un módulo del vendedor (404 si no) |
-| GET    | /pedidos           | Lista pedidos con sus líneas; `?cliente_id=` filtra por cliente |
+| GET    | /pedidos           | Lista pedidos con sus líneas y fechas (`fecha` = `EffectiveDate`, `fecha_creacion` = `CreatedDate` en UTC); `?cliente_id=` filtra por cliente |
 | POST   | /pedidos           | Crear pedido                  |
 | PUT    | /pedidos/{id}      | Actualizar pedido             |
 | GET    | /productos         | Lista productos               |

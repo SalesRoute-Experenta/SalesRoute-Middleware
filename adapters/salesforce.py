@@ -136,7 +136,7 @@ class SalesforceAdapter(CRMAdapter):
     def get_pedidos(self, cliente_id: str | None = None) -> list[dict]:
         filtro = f"WHERE AccountId = '{_safe_id(cliente_id)}' " if cliente_id else ""
         records = self.sf.query_all(
-            "SELECT Id, OrderNumber, Status, TotalAmount, AccountId, "
+            "SELECT Id, OrderNumber, Status, TotalAmount, AccountId, EffectiveDate, CreatedDate, "
             "(SELECT Product2Id, Product2.Name, Quantity, UnitPrice, TotalPrice FROM OrderItems) "
             f"FROM Order {filtro}ORDER BY CreatedDate DESC"
         )
@@ -218,6 +218,8 @@ class SalesforceAdapter(CRMAdapter):
             "estado":     r.get("Status"),
             "total":      r.get("TotalAmount"),
             "cliente_id": r.get("AccountId"),
+            "fecha":          r.get("EffectiveDate"),
+            "fecha_creacion": r.get("CreatedDate"),
             "lineas": [
                 {
                     "producto_id":     i.get("Product2Id"),
