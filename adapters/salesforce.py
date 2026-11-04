@@ -144,14 +144,34 @@ class SalesforceAdapter(CRMAdapter):
 
     # ── Pedidos ───────────────────────────────────────────────────────────────
 
-    def get_pedidos(self, cliente_id: str | None = None) -> list[dict]:
-        filtro = f"WHERE AccountId = '{_safe_id(cliente_id)}' " if cliente_id else ""
+    _PEDIDO_FIELDS = (
+        "Id, OrderNumber, Status, TotalAmount, AccountId, EffectiveDate, CreatedDate, "
+        "(SELECT Product2Id, Product2.Name, Quantity, UnitPrice, TotalPrice FROM OrderItems)"
+    )
+
+    # Los pedidos del vendedor son los de los clientes de su cartera (mismo filtro que /clientes).
+    # Con ?cliente_id= de un cliente fuera de la cartera la lista sale vacía, sin revelar nada.
+    def _pedidos_cartera(self, vendedor_id: str | None) -> str:
+        return f"AccountId IN (SELECT Id FROM Account WHERE {self._cartera(vendedor_id)})"
+
+    def get_pedidos(self, vendedor_id: str | None, cliente_id: str | None = None) -> list[dict]:
+        filtro = self._pedidos_cartera(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulos
+        if cliente_id:
+            filtro += f" AND AccountId = '{_safe_id(cliente_id)}'"
         records = self.sf.query_all(
-            "SELECT Id, OrderNumber, Status, TotalAmount, AccountId, EffectiveDate, CreatedDate, "
-            "(SELECT Product2Id, Product2.Name, Quantity, UnitPrice, TotalPrice FROM OrderItems) "
-            f"FROM Order {filtro}ORDER BY CreatedDate DESC"
+            f"SELECT {self._PEDIDO_FIELDS} FROM Order WHERE {filtro} ORDER BY CreatedDate DESC"
         )
         return [self._pedido(r) for r in records]
+
+    def get_pedido(self, vendedor_id: str | None, record_id: str) -> dict:
+        data = self.sf.query(
+            f"SELECT {self._PEDIDO_FIELDS} FROM Order "
+            f"WHERE Id = '{_safe_id(record_id)}' AND {self._pedidos_cartera(vendedor_id)} LIMIT 1"
+        )
+        records = data.get("records", [])
+        if not records:
+            raise ValueError(f"Pedido {record_id} no encontrado")
+        return self._pedido(records[0])
 
     def crear_pedido(self, vendedor_id: str | None, data: dict) -> dict:
         from datetime import date
