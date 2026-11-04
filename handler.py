@@ -74,7 +74,7 @@ def handler(event, context):
         if path == "/pedidos" and method == "GET":
             return _ok(adapter.get_pedidos(qs.get("cliente_id")))
         if path == "/pedidos" and method == "POST":
-            return _ok(adapter.crear_pedido(body))
+            return _ok(adapter.crear_pedido(vendedor_id, body))
         if path.startswith("/pedidos/") and method == "PUT":
             record_id = path.split("/")[-1]
             return _ok(adapter.actualizar_pedido(record_id, body))

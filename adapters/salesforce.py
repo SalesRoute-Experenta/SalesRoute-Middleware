@@ -1,6 +1,8 @@
 import re
 from datetime import date, datetime, timedelta, timezone
 
+from requests.exceptions import HTTPError
+
 from adapters.base import CRMAdapter
 from sf_client import SalesforceClient
 
@@ -15,6 +17,15 @@ def _safe_id(record_id: str) -> str:
     if not _SF_ID_RE.match(record_id):
         raise ValueError(f"ID inválido: {record_id!r}")
     return record_id
+
+
+def _mensaje_sf(resp) -> str:
+    # Mensaje de error que devuelve Salesforce: [{"message": "...", "errorCode": "..."}].
+    try:
+        detalle = resp.json()[0]
+        return f"{detalle.get('errorCode')}: {detalle.get('message')}"[:300]
+    except Exception:
+        return "el CRM rechazó la petición"
 
 
 def _zona(offset: str) -> timezone:
@@ -142,10 +153,11 @@ class SalesforceAdapter(CRMAdapter):
         )
         return [self._pedido(r) for r in records]
 
-    def crear_pedido(self, data: dict) -> dict:
+    def crear_pedido(self, vendedor_id: str | None, data: dict) -> dict:
         from datetime import date
         if not data.get("cliente_id"):
             raise ValueError("Campo requerido: cliente_id")
+        self._validar_cliente_en_cartera(vendedor_id, data["cliente_id"])
         pricebook_id = data.get("pricebook_id") or self._get_standard_pricebook_id()
         order_payload = {
             "AccountId":     data["cliente_id"],
@@ -153,7 +165,7 @@ class SalesforceAdapter(CRMAdapter):
             "EffectiveDate": data.get("fecha") or date.today().isoformat(),
             "Pricebook2Id":  pricebook_id,
         }
-        result = self.sf.create("Order", order_payload)
+        result = self._crear("Order", order_payload)
         order_id = result["id"]
 
         productos = data.get("productos") or []
@@ -167,7 +179,7 @@ class SalesforceAdapter(CRMAdapter):
             if not entry:
                 continue
             unit_price = entry.get("UnitPrice", 0)
-            self.sf.create("OrderItem", {
+            self._crear("OrderItem", {
                 "OrderId":          order_id,
                 "Product2Id":       producto_id,
                 "PricebookEntryId": entry["Id"],
@@ -186,6 +198,26 @@ class SalesforceAdapter(CRMAdapter):
             estado = "Draft"
 
         return {"id": order_id, "estado": estado, "cliente_id": data["cliente_id"], "total": total}
+
+    def _validar_cliente_en_cartera(self, vendedor_id: str | None, cliente_id) -> None:
+        # Un pedido solo se crea para un cliente de la cartera del vendedor (mismo filtro que GET /clientes/{id}).
+        # Cliente inexistente, con formato inválido o ajeno responden igual (404), sin revelar cuál es el caso.
+        cartera = self._cartera(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulos
+        if not isinstance(cliente_id, str) or not _SF_ID_RE.match(cliente_id):
+            raise ValueError(f"Cliente {cliente_id} no encontrado")
+        data = self.sf.query(f"SELECT Id FROM Account WHERE Id = '{cliente_id}' AND {cartera} LIMIT 1")
+        if not data.get("records"):
+            raise ValueError(f"Cliente {cliente_id} no encontrado")
+
+    def _crear(self, sobject: str, payload: dict) -> dict:
+        # Un 400 de Salesforce al crear significa petición inválida, no un fallo del CRM:
+        # sale como 400 (no reintentable) y no como 502.
+        try:
+            return self.sf.create(sobject, payload)
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 400:
+                raise ValueError(f"Dato inválido: {_mensaje_sf(e.response)}") from e
+            raise
 
     def _get_pricebook_entry(self, producto_id: str, pricebook_id: str) -> dict | None:
         data = self.sf.query(

@@ -66,7 +66,7 @@ Para `experenta_crm`:
 | GET    | /clientes          | Clientes activos de los módulos del vendedor |
 | GET    | /clientes/{id}     | Cliente por ID, si es de un módulo del vendedor (404 si no) |
 | GET    | /pedidos           | Lista pedidos con sus líneas y fechas (`fecha` = `EffectiveDate`, `fecha_creacion` = `CreatedDate` en UTC); `?cliente_id=` filtra por cliente |
-| POST   | /pedidos           | Crear pedido                  |
+| POST   | /pedidos           | Crear pedido. `cliente_id` debe ser un cliente de la cartera del vendedor (mismo filtro que `GET /clientes/{id}`); si no existe, es inválido o es ajeno: 404 "Cliente X no encontrado". Un 400 de Salesforce al crear sale como 400 `Dato inválido: ...` y no como 502 |
 | PUT    | /pedidos/{id}      | Actualizar pedido             |
 | GET    | /productos         | Lista productos               |
 | GET    | /productos/{id}    | Producto por ID               |

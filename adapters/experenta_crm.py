@@ -136,7 +136,7 @@ class ExperentaCRMAdapter(CRMAdapter):
             pedidos = [p for p in pedidos if p["cliente_id"] == cliente_id]
         return pedidos
 
-    def crear_pedido(self, data: dict) -> dict:
+    def crear_pedido(self, vendedor_id: str | None, data: dict) -> dict:
         raise NotImplementedError("Crear pedido: pendiente en MCP")
 
     def actualizar_pedido(self, record_id: str, data: dict) -> dict:
