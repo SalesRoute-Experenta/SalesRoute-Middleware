@@ -129,14 +129,21 @@ class ExperentaCRMAdapter(CRMAdapter):
 
     # ── Pedidos → Cotizaciones ────────────────────────────────────────────────
 
-    def get_pedidos(self, cliente_id: str | None = None) -> list[dict]:
+    # En CRM Experenta no hay módulos: igual que /clientes, no se filtra por vendedor.
+    def get_pedidos(self, vendedor_id: str | None, cliente_id: str | None = None) -> list[dict]:
         result = self._call("buscar_cotizaciones", {"limit": 200})
         pedidos = [self._pedido(r) for r in result.get("data", [])]
         if cliente_id:
             pedidos = [p for p in pedidos if p["cliente_id"] == cliente_id]
         return pedidos
 
-    def crear_pedido(self, data: dict) -> dict:
+    def get_pedido(self, vendedor_id: str | None, record_id: str) -> dict:
+        for pedido in self.get_pedidos(vendedor_id):
+            if pedido["id"] == record_id:
+                return pedido
+        raise ValueError(f"Pedido {record_id} no encontrado")
+
+    def crear_pedido(self, vendedor_id: str | None, data: dict) -> dict:
         raise NotImplementedError("Crear pedido: pendiente en MCP")
 
     def actualizar_pedido(self, record_id: str, data: dict) -> dict:
