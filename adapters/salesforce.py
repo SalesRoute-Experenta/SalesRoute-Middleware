@@ -95,7 +95,7 @@ class SalesforceAdapter(CRMAdapter):
         "Id, Name, Nombre_de_negocio__c, Phone, Id_Externo__c, ParentId, "
         "ShippingStreet, ShippingCity, ShippingState, ShippingPostalCode, ShippingCountry, "
         "ShippingLatitude, ShippingLongitude, "
-        "Dias_de_visita__c"
+        "Dias_de_visita__c, Lista_de_precios__c, Lista_de_precios__r.Name"
     )
 
     # La cartera del vendedor son las cuentas activas de sus módulos (Account.Modulo__c).
@@ -140,6 +140,9 @@ class SalesforceAdapter(CRMAdapter):
             "lat":         r.get("ShippingLatitude"),
             "lng":         r.get("ShippingLongitude"),
             "dias_visita": dias,
+            # Lista de precios del cliente (Pricebook2). null = sin lista: la app no le permite crear pedidos.
+            "lista_precios_id": r.get("Lista_de_precios__c"),
+            "lista_precios":    (r.get("Lista_de_precios__r") or {}).get("Name"),
         }
 
     # ── Pedidos ───────────────────────────────────────────────────────────────
