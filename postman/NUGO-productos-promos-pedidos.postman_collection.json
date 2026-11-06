@@ -1,0 +1,477 @@
+{
+  "info": {
+    "name": "NUGO Middleware - Productos, promos y pedidos (v1)",
+    "description": "Valida los contratos GET /clientes (lista de precios), GET /productos, GET /promos y POST /pedidos con totales. Ejecutar en orden. El paso 4 CREA un pedido real: usar un cliente de prueba y con aprobación. Llenar cognitoUser y cognitoPassword (no commitear).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Hoy en Honduras (-06:00).",
+          "pm.collectionVariables.set('fecha', new Date(Date.now() - 6 * 3600 * 1000).toISOString().slice(0, 10));"
+        ]
+      }
+    }
+  ],
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{idToken}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "https://ptuahkpry5.execute-api.us-east-2.amazonaws.com/prod"
+    },
+    {
+      "key": "idToken",
+      "value": ""
+    },
+    {
+      "key": "fecha",
+      "value": ""
+    },
+    {
+      "key": "clienteId",
+      "value": ""
+    },
+    {
+      "key": "listaPreciosId",
+      "value": ""
+    },
+    {
+      "key": "productoId",
+      "value": ""
+    },
+    {
+      "key": "productoPrecio",
+      "value": ""
+    },
+    {
+      "key": "productoIva",
+      "value": ""
+    },
+    {
+      "key": "pedidoBody",
+      "value": ""
+    },
+    {
+      "key": "pedidoTotal",
+      "value": ""
+    },
+    {
+      "key": "pedidoId",
+      "value": ""
+    },
+    {
+      "key": "cognitoClientId",
+      "value": "5knig3l34q3ushbobck2lc4t5t"
+    },
+    {
+      "key": "cognitoUser",
+      "value": ""
+    },
+    {
+      "key": "cognitoPassword",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "0. Login en Cognito (obtiene el ID token)",
+      "request": {
+        "auth": {
+          "type": "noauth"
+        },
+        "method": "POST",
+        "url": "https://cognito-idp.us-east-2.amazonaws.com/",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/x-amz-json-1.1"
+          },
+          {
+            "key": "X-Amz-Target",
+            "value": "AWSCognitoIdentityProviderService.InitiateAuth"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"AuthFlow\": \"USER_PASSWORD_AUTH\",\n  \"ClientId\": \"{{cognitoClientId}}\",\n  \"AuthParameters\": { \"USERNAME\": \"{{cognitoUser}}\", \"PASSWORD\": \"{{cognitoPassword}}\" }\n}"
+        },
+        "description": "Llenar cognitoUser y cognitoPassword en las variables de la colección (no commitear credenciales). Guarda el IdToken en idToken."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('login 200', () => pm.response.to.have.status(200));",
+              "pm.collectionVariables.set('idToken', pm.response.json().AuthenticationResult.IdToken);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "1. GET /clientes (lista de precios del cliente)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/clientes",
+        "description": "Cada cliente trae lista_precios_id y lista_precios (null = sin lista). Guarda el primero que tenga lista en clienteId y listaPreciosId."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));",
+              "const cs = pm.response.json();",
+              "pm.test('es un arreglo y trae lista_precios_id / lista_precios', () => { pm.expect(cs).to.be.an('array'); cs.forEach(c => { pm.expect(c).to.have.property('lista_precios_id'); pm.expect(c).to.have.property('lista_precios'); }); });",
+              "const c = cs.find(x => x.lista_precios_id);",
+              "pm.test('hay al menos un cliente con lista de precios', () => pm.expect(c, 'ningún cliente tiene Account.Price_Book__c').to.exist);",
+              "if (c) { pm.collectionVariables.set('clienteId', c.id); pm.collectionVariables.set('listaPreciosId', c.lista_precios_id); }"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. GET /productos (atributos, IVA, precios por lista)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/productos",
+        "description": "Cada producto trae marca, categoria, presentacion, capacidad, iva_porcentaje, unidades_por_caja y precios[] (una entrada por lista con precio y precio_caja). Guarda un producto con precio en la lista del cliente."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));",
+              "const ps = pm.response.json();",
+              "pm.test('estructura del producto', () => { pm.expect(ps).to.be.an('array').that.is.not.empty; ['id','nombre','codigo','marca','categoria','presentacion','capacidad','iva_porcentaje','unidades_por_caja','precios'].forEach(k => pm.expect(ps[0]).to.have.property(k)); });",
+              "pm.test('precios[] con lista y precio', () => { const con = ps.find(p => p.precios.length); pm.expect(con, 'ningún producto tiene precio en una lista').to.exist; ['lista_precios_id','lista_precios','precio','precio_caja'].forEach(k => pm.expect(con.precios[0]).to.have.property(k)); });",
+              "const lista = pm.collectionVariables.get('listaPreciosId');",
+              "const p = ps.find(x => x.precios.some(e => e.lista_precios_id === lista && e.precio > 0));",
+              "pm.test('hay un producto con precio en la lista del cliente', () => pm.expect(p, 'sin producto con precio en la lista del cliente').to.exist);",
+              "if (p) { pm.collectionVariables.set('productoId', p.id); pm.collectionVariables.set('productoPrecio', p.precios.find(e => e.lista_precios_id === lista).precio); pm.collectionVariables.set('productoIva', p.iva_porcentaje || 0); }"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. GET /promos (vigentes, con listas y acciones)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/promos",
+        "description": "Solo promos activas y vigentes hoy. Cada una trae listas_precios_id (vacío = todas), condiciones_relacion, condiciones (medida, operador, valor) y acciones (tipo, unidad, descuento_tipo, descuento_valor)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));",
+              "const ps = pm.response.json();",
+              "pm.test('es un arreglo', () => pm.expect(ps).to.be.an('array'));",
+              "pm.test('estructura de cada promo', () => ps.forEach(p => { ['id','nombre','fecha_inicio','fecha_fin','listas_precios_id','condiciones_relacion','condiciones','acciones'].forEach(k => pm.expect(p).to.have.property(k)); pm.expect(p.listas_precios_id).to.be.an('array'); }));",
+              "pm.test('operador y medida normalizados', () => ps.forEach(p => p.condiciones.forEach(c => { pm.expect(['por_cada','igual','mayor','mayor_igual','menor','menor_igual']).to.include(c.operador); pm.expect(['unidades','cajas','monto']).to.include(c.medida); })));",
+              "pm.test('acciones: tipo y unidad', () => ps.forEach(p => p.acciones.forEach(a => { pm.expect(['bonificacion','descuento']).to.include(a.tipo); if (a.tipo === 'bonificacion') pm.expect(['unidades','cajas']).to.include(a.unidad); })));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. POST /pedidos (CREA un pedido real en Salesforce)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/pedidos",
+        "description": "ATENCIÓN: crea un pedido Activated en Salesforce. Usar solo con un cliente de prueba y con aprobación. Arma el body con datos reales de los pasos 1 y 2 (para el ejemplo completo con descuento y bonificación ver el MD de la app).",
+        "body": {
+          "mode": "raw",
+          "raw": "{{pedidoBody}}"
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Arma un pedido válido con datos reales (pasos 1 y 2): 2 unidades del producto, sin descuento. Montos en centavos para no tener errores de coma flotante.",
+              "const cant = 2;",
+              "const precio = Number(pm.collectionVariables.get('productoPrecio'));",
+              "const pct = Number(pm.collectionVariables.get('productoIva'));",
+              "const sub = Math.round(precio * 100) * cant;",
+              "const iva = Math.floor(sub * pct / 100 + 0.5 + 1e-9);   // redondeo half-up a centavos",
+              "const m = c => Math.round(c) / 100;",
+              "const linea = { producto_id: pm.collectionVariables.get('productoId'), cantidad: cant, precio_unitario: precio, subtotal: m(sub), descuento: 0, iva_porcentaje: pct, iva: m(iva), total: m(sub + iva), bonificacion: false, promo_id: null, valor_lista: null };",
+              "const pedido = { id_local: pm.variables.replaceIn('{{$guid}}'), cliente_id: pm.collectionVariables.get('clienteId'), lista_precios_id: pm.collectionVariables.get('listaPreciosId'), tipo: 'nuevo', fecha: pm.collectionVariables.get('fecha'), lineas: [linea], subtotal: m(sub), descuento: 0, iva: m(iva), total: m(sub + iva) };",
+              "pm.collectionVariables.set('pedidoBody', JSON.stringify(pedido));",
+              "pm.collectionVariables.set('pedidoTotal', pedido.total);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));",
+              "const r = pm.response.json();",
+              "pm.test('respuesta: id, numero, estado, id_local, total', () => { ['id','numero','estado','id_local','total'].forEach(k => pm.expect(r).to.have.property(k)); pm.expect(r.estado).to.eql('Activated'); pm.expect(r.total).to.eql(Number(pm.collectionVariables.get('pedidoTotal'))); });",
+              "pm.collectionVariables.set('pedidoId', r.id);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. POST /pedidos con precio distinto al de la lista",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/pedidos",
+        "description": "El precio_unitario no coincide con PricebookEntry. Debe responder 400 y NO crear nada.",
+        "body": {
+          "mode": "raw",
+          "raw": "{{pedidoBody}}"
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Arma un pedido válido con datos reales (pasos 1 y 2): 2 unidades del producto, sin descuento. Montos en centavos para no tener errores de coma flotante.",
+              "const cant = 2;",
+              "const precio = Number(pm.collectionVariables.get('productoPrecio'));",
+              "const pct = Number(pm.collectionVariables.get('productoIva'));",
+              "const sub = Math.round(precio * 100) * cant;",
+              "const iva = Math.floor(sub * pct / 100 + 0.5 + 1e-9);   // redondeo half-up a centavos",
+              "const m = c => Math.round(c) / 100;",
+              "const linea = { producto_id: pm.collectionVariables.get('productoId'), cantidad: cant, precio_unitario: precio, subtotal: m(sub), descuento: 0, iva_porcentaje: pct, iva: m(iva), total: m(sub + iva), bonificacion: false, promo_id: null, valor_lista: null };",
+              "const pedido = { id_local: pm.variables.replaceIn('{{$guid}}'), cliente_id: pm.collectionVariables.get('clienteId'), lista_precios_id: pm.collectionVariables.get('listaPreciosId'), tipo: 'nuevo', fecha: pm.collectionVariables.get('fecha'), lineas: [linea], subtotal: m(sub), descuento: 0, iva: m(iva), total: m(sub + iva) };",
+              "const p = pedido;",
+              "p.lineas[0].precio_unitario = p.lineas[0].precio_unitario + 1;",
+              "pm.collectionVariables.set('pedidoBody', JSON.stringify(p));"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('400', () => pm.response.to.have.status(400));",
+              "pm.test('mensaje Dato inválido', () => { const e = pm.response.json().error; pm.expect(e).to.include('Dato inválido'); pm.expect(e).to.include(\"precio_unitario\"); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "6. POST /pedidos con total que no cuadra",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/pedidos",
+        "description": "El total del pedido no es subtotal - descuento + iva. Debe responder 400 y NO crear nada.",
+        "body": {
+          "mode": "raw",
+          "raw": "{{pedidoBody}}"
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Arma un pedido válido con datos reales (pasos 1 y 2): 2 unidades del producto, sin descuento. Montos en centavos para no tener errores de coma flotante.",
+              "const cant = 2;",
+              "const precio = Number(pm.collectionVariables.get('productoPrecio'));",
+              "const pct = Number(pm.collectionVariables.get('productoIva'));",
+              "const sub = Math.round(precio * 100) * cant;",
+              "const iva = Math.floor(sub * pct / 100 + 0.5 + 1e-9);   // redondeo half-up a centavos",
+              "const m = c => Math.round(c) / 100;",
+              "const linea = { producto_id: pm.collectionVariables.get('productoId'), cantidad: cant, precio_unitario: precio, subtotal: m(sub), descuento: 0, iva_porcentaje: pct, iva: m(iva), total: m(sub + iva), bonificacion: false, promo_id: null, valor_lista: null };",
+              "const pedido = { id_local: pm.variables.replaceIn('{{$guid}}'), cliente_id: pm.collectionVariables.get('clienteId'), lista_precios_id: pm.collectionVariables.get('listaPreciosId'), tipo: 'nuevo', fecha: pm.collectionVariables.get('fecha'), lineas: [linea], subtotal: m(sub), descuento: 0, iva: m(iva), total: m(sub + iva) };",
+              "const p = pedido;",
+              "p.total = p.total + 0.01;",
+              "pm.collectionVariables.set('pedidoBody', JSON.stringify(p));"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('400', () => pm.response.to.have.status(400));",
+              "pm.test('mensaje Dato inválido', () => { const e = pm.response.json().error; pm.expect(e).to.include('Dato inválido'); pm.expect(e).to.include(\"total del pedido\"); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "7. POST /pedidos con lista que no es la del cliente",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/pedidos",
+        "description": "lista_precios_id distinta de la lista del cliente. Debe responder 400 y NO crear nada.",
+        "body": {
+          "mode": "raw",
+          "raw": "{{pedidoBody}}"
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Arma un pedido válido con datos reales (pasos 1 y 2): 2 unidades del producto, sin descuento. Montos en centavos para no tener errores de coma flotante.",
+              "const cant = 2;",
+              "const precio = Number(pm.collectionVariables.get('productoPrecio'));",
+              "const pct = Number(pm.collectionVariables.get('productoIva'));",
+              "const sub = Math.round(precio * 100) * cant;",
+              "const iva = Math.floor(sub * pct / 100 + 0.5 + 1e-9);   // redondeo half-up a centavos",
+              "const m = c => Math.round(c) / 100;",
+              "const linea = { producto_id: pm.collectionVariables.get('productoId'), cantidad: cant, precio_unitario: precio, subtotal: m(sub), descuento: 0, iva_porcentaje: pct, iva: m(iva), total: m(sub + iva), bonificacion: false, promo_id: null, valor_lista: null };",
+              "const pedido = { id_local: pm.variables.replaceIn('{{$guid}}'), cliente_id: pm.collectionVariables.get('clienteId'), lista_precios_id: pm.collectionVariables.get('listaPreciosId'), tipo: 'nuevo', fecha: pm.collectionVariables.get('fecha'), lineas: [linea], subtotal: m(sub), descuento: 0, iva: m(iva), total: m(sub + iva) };",
+              "const p = pedido;",
+              "p.lista_precios_id = '01s000000000000AAA';",
+              "pm.collectionVariables.set('pedidoBody', JSON.stringify(p));"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('400', () => pm.response.to.have.status(400));",
+              "pm.test('mensaje Dato inválido', () => { const e = pm.response.json().error; pm.expect(e).to.include('Dato inválido'); pm.expect(e).to.include(\"lista_precios_id\"); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "8. POST /pedidos con cantidad decimal",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/pedidos",
+        "description": "La cantidad debe ser un entero. Debe responder 400 y NO crear nada.",
+        "body": {
+          "mode": "raw",
+          "raw": "{{pedidoBody}}"
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Arma un pedido válido con datos reales (pasos 1 y 2): 2 unidades del producto, sin descuento. Montos en centavos para no tener errores de coma flotante.",
+              "const cant = 2;",
+              "const precio = Number(pm.collectionVariables.get('productoPrecio'));",
+              "const pct = Number(pm.collectionVariables.get('productoIva'));",
+              "const sub = Math.round(precio * 100) * cant;",
+              "const iva = Math.floor(sub * pct / 100 + 0.5 + 1e-9);   // redondeo half-up a centavos",
+              "const m = c => Math.round(c) / 100;",
+              "const linea = { producto_id: pm.collectionVariables.get('productoId'), cantidad: cant, precio_unitario: precio, subtotal: m(sub), descuento: 0, iva_porcentaje: pct, iva: m(iva), total: m(sub + iva), bonificacion: false, promo_id: null, valor_lista: null };",
+              "const pedido = { id_local: pm.variables.replaceIn('{{$guid}}'), cliente_id: pm.collectionVariables.get('clienteId'), lista_precios_id: pm.collectionVariables.get('listaPreciosId'), tipo: 'nuevo', fecha: pm.collectionVariables.get('fecha'), lineas: [linea], subtotal: m(sub), descuento: 0, iva: m(iva), total: m(sub + iva) };",
+              "const p = pedido;",
+              "p.lineas[0].cantidad = 1.5;",
+              "pm.collectionVariables.set('pedidoBody', JSON.stringify(p));"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('400', () => pm.response.to.have.status(400));",
+              "pm.test('mensaje Dato inválido', () => { const e = pm.response.json().error; pm.expect(e).to.include('Dato inválido'); pm.expect(e).to.include(\"entero\"); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "9. GET /pedidos/{id} (el pedido creado en el paso 4)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/pedidos/{{pedidoId}}",
+        "description": "Devuelve subtotal, descuento, iva y total del pedido y, por línea, descuento, iva_porcentaje, iva, bonificacion, promo_id y valor_lista."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));",
+              "const o = pm.response.json();",
+              "pm.test('totales del pedido', () => { ['subtotal','descuento','iva','total','lineas'].forEach(k => pm.expect(o).to.have.property(k)); pm.expect(o.total).to.eql(Number(pm.collectionVariables.get('pedidoTotal'))); });",
+              "pm.test('campos por línea', () => ['descuento','iva_porcentaje','iva','bonificacion','promo_id','valor_lista'].forEach(k => pm.expect(o.lineas[0]).to.have.property(k)));"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
