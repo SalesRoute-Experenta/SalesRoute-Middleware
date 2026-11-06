@@ -275,9 +275,13 @@ class SalesforceAdapter(CRMAdapter):
             if pid not in ids:
                 ids.append(pid)
         in_ids = ", ".join(f"'{x}'" for x in ids)
-        entradas = {e["Product2Id"]: e for e in self.sf.query_all(
-            f"SELECT Id, Product2Id, UnitPrice FROM PricebookEntry "
-            f"WHERE Pricebook2Id = '{lista}' AND IsActive = true AND Product2Id IN ({in_ids})")}
+        moneda = cliente.get("CurrencyIsoCode")   # None si la org no es multimoneda
+        entradas = {}
+        for e in self._query_moneda(
+            lambda m: f"SELECT Id, Product2Id, UnitPrice{', CurrencyIsoCode' if m else ''} FROM PricebookEntry "
+                      f"WHERE Pricebook2Id = '{lista}' AND IsActive = true AND Product2Id IN ({in_ids})", todo=True):
+            if moneda is None or e.get("CurrencyIsoCode") in (None, moneda):
+                entradas[e["Product2Id"]] = e
         iva_prod = {p["Id"]: p.get("IVA__c") for p in self.sf.query_all(
             f"SELECT Id, IVA__c FROM Product2 WHERE Id IN ({in_ids})")}
         promo_ids = sorted({l["promo_id"] for l in lineas if l.get("promo_id")})
@@ -298,7 +302,7 @@ class SalesforceAdapter(CRMAdapter):
             pid = l["producto_id"]
             entrada = entradas.get(pid)
             if not entrada:
-                raise ValueError(f"Dato inválido: {n}: el producto {pid} no tiene precio en la lista del cliente")
+                raise ValueError(f"Dato inválido: {n}: el producto {pid} no tiene precio en la lista del cliente"+(f" en {moneda}" if moneda else ""))
             cant = self._dec(l.get("cantidad"), f"{n}: cantidad")
             if cant <= 0 or cant != cant.to_integral_value():
                 raise ValueError(f"Dato inválido: {n}: cantidad debe ser un entero mayor que 0")
@@ -343,6 +347,7 @@ class SalesforceAdapter(CRMAdapter):
         # Sin transacción multi-objeto en este flujo: si falla una línea se borra el pedido (todo o nada).
         order_id = self._crear("Order", {
             "AccountId": cliente_id, "Status": "Draft", "EffectiveDate": fecha, "Pricebook2Id": lista,
+            **({"CurrencyIsoCode": moneda} if moneda else {}),
             "Subtotal__c": float(t_sub), "Descuento__c": float(t_desc), "IVA__c": float(t_iva), "Total__c": float(t_total),
         })["id"]
         try:
@@ -369,11 +374,23 @@ class SalesforceAdapter(CRMAdapter):
         return {"id": order_id, "numero": recs[0].get("OrderNumber"), "estado": "Activated",
                 "id_local": data.get("id_local"), "total": float(t_total)}
 
+    def _query_moneda(self, soql, todo: bool = False):
+        """Consulta con CurrencyIsoCode; si la org no es multimoneda (campo inexistente) repite sin él."""
+        run = self.sf.query_all if todo else self.sf.query
+        try:
+            return run(soql(True))
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 400:
+                return run(soql(False))
+            raise
+
     def _cliente_de_cartera(self, vendedor_id: str | None, cliente_id) -> dict:
         cartera = self._cartera(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulos
         if not isinstance(cliente_id, str) or not _SF_ID_RE.match(cliente_id):
             raise ValueError(f"Cliente {cliente_id} no encontrado")
-        recs = self.sf.query(f"SELECT Id, Price_Book__c FROM Account WHERE Id = '{cliente_id}' AND {cartera} LIMIT 1").get("records")
+        recs = self._query_moneda(
+            lambda m: f"SELECT Id, Price_Book__c{', CurrencyIsoCode' if m else ''} FROM Account WHERE Id = '{cliente_id}' AND {cartera} LIMIT 1"
+        ).get("records")
         if not recs:
             raise ValueError(f"Cliente {cliente_id} no encontrado")
         return recs[0]
@@ -468,11 +485,10 @@ class SalesforceAdapter(CRMAdapter):
 
         # Precios por lista: una entrada de `precios` por cada PricebookEntry activa (incluida la estándar).
         # `precio` (campo anterior) sigue saliendo del Pricebook estándar.
-        entries = self.sf.query_all(
-            "SELECT Product2Id, Pricebook2Id, Pricebook2.Name, Pricebook2.IsStandard, "
-            "UnitPrice, List_Box_Price__c FROM PricebookEntry "
-            "WHERE IsActive = true AND Product2.IsActive = true"
-        )
+        entries = self._query_moneda(
+            lambda m: "SELECT Product2Id, Pricebook2Id, Pricebook2.Name, Pricebook2.IsStandard, "
+                      f"UnitPrice, List_Box_Price__c{', CurrencyIsoCode' if m else ''} FROM PricebookEntry "
+                      "WHERE IsActive = true AND Product2.IsActive = true", todo=True)
         por_producto: dict[str, list[dict]] = {}
         estandar: dict[str, float] = {}
         for e in entries:
@@ -484,6 +500,7 @@ class SalesforceAdapter(CRMAdapter):
                 "lista_precios":    pb.get("Name"),
                 "precio":           e.get("UnitPrice"),
                 "precio_caja":      e.get("List_Box_Price__c"),
+                "moneda":           e.get("CurrencyIsoCode"),
             })
         for p in productos:
             p["precios"] = por_producto.get(p["id"], [])
