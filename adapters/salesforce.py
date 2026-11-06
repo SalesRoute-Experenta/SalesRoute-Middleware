@@ -466,7 +466,7 @@ class SalesforceAdapter(CRMAdapter):
         )
         productos = [self._producto(r) for r in records]
 
-        # Precios por lista: una entrada de `precios` por cada PricebookEntry activa.
+        # Precios por lista: una entrada de `precios` por cada PricebookEntry activa (incluida la estándar).
         # `precio` (campo anterior) sigue saliendo del Pricebook estándar.
         entries = self.sf.query_all(
             "SELECT Product2Id, Pricebook2Id, Pricebook2.Name, Pricebook2.IsStandard, "
@@ -478,8 +478,7 @@ class SalesforceAdapter(CRMAdapter):
         for e in entries:
             pb = e.get("Pricebook2") or {}
             if pb.get("IsStandard"):
-                estandar[e["Product2Id"]] = e.get("UnitPrice")
-                continue
+                estandar[e["Product2Id"]] = e.get("UnitPrice")   # y también sale en precios[]: un cliente puede tener asignado el estándar
             por_producto.setdefault(e["Product2Id"], []).append({
                 "lista_precios_id": e.get("Pricebook2Id"),
                 "lista_precios":    pb.get("Name"),
