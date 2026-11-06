@@ -63,7 +63,7 @@ Para `experenta_crm`:
 | Método | Ruta               | Descripción                  |
 |--------|--------------------|------------------------------|
 | GET    | /perfil            | `vendedor_id` y módulos del vendedor; 403 sin `custom:vendedor_id` o sin módulo. La app lo pide al iniciar sesión |
-| GET    | /clientes          | Clientes activos de los módulos del vendedor, con su lista de precios (`lista_precios_id`, `lista_precios` desde `Account.Lista_de_precios__c`; `null` = sin lista, la app no le permite crear pedidos). Requiere que ese campo exista en la org y que la integración pueda leerlo |
+| GET    | /clientes          | Clientes activos de los módulos del vendedor, con su lista de precios (`lista_precios_id`, `lista_precios` desde `Account.Price_Book__c`; `null` = sin lista, la app no le permite crear pedidos). Requiere que ese campo exista en la org y que la integración pueda leerlo |
 | GET    | /clientes/{id}     | Cliente por ID, si es de un módulo del vendedor (404 si no); incluye la lista de precios |
 | GET    | /pedidos           | Lista los pedidos de los clientes de la cartera del vendedor (mismo filtro que `/clientes`), con sus líneas y fechas (`fecha` = `EffectiveDate`, `fecha_creacion` = `CreatedDate` en UTC); 403 sin `custom:vendedor_id` o sin módulo. `?cliente_id=` filtra por cliente; si no es de la cartera devuelve lista vacía |
 | GET    | /pedidos/{id}      | Pedido por ID, si es de un cliente de la cartera del vendedor (404 si no) |
