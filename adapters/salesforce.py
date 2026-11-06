@@ -1,4 +1,5 @@
 import re
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 
 from requests.exceptions import HTTPError
@@ -377,51 +378,101 @@ class SalesforceAdapter(CRMAdapter):
     # ── Promos ────────────────────────────────────────────────────────────────
 
     def get_promos(self) -> list[dict]:
+        # Solo activas y vigentes hoy (fecha en la zona horaria del tenant).
+        hoy = datetime.now(self.zona).date().isoformat()
         data = self.sf.query(
             "SELECT Id, Name, Descripcion__c, Estado__c, Criterio__c, "
             "FechaInicio__c, FechaFin__c, "
-            "(SELECT Id, Name, Product__c, Cantidad__c, TipoMedida__c FROM PromosAcciones__r), "
+            "(SELECT Id, Name, Product__c, Cantidad__c, TipoMedida__c, "
+            "Tipo__c, Tipo_descuento__c, Valor_descuento__c FROM PromosAcciones__r), "
             "(SELECT Id, Name, Producto__c, Capacidad__c, Presentacion__c, "
             "Operador__c, TipoMedida__c, Valor__c FROM PromosCondiciones__r) "
-            "FROM Promocion__c WHERE Estado__c = 'Activa'"
+            "FROM Promocion__c WHERE Estado__c = 'Activa' "
+            f"AND (FechaInicio__c = null OR FechaInicio__c <= {hoy}) "
+            f"AND (FechaFin__c = null OR FechaFin__c >= {hoy})"
         )
-        return [self._promo(r) for r in data.get("records", [])]
+        promos = data.get("records", [])
 
-    def _promo(self, r: dict) -> dict:
+        # Listas de precios por promo (junction). Sin filas = aplica a todas las listas.
+        listas: dict[str, list[str]] = {}
+        if promos:
+            for j in self.sf.query_all("SELECT Promocion__c, Price_Book__c FROM Promocion_lista_precios__c"):
+                listas.setdefault(j["Promocion__c"], []).append(j["Price_Book__c"])
+        return [self._promo(r, listas.get(r["Id"], [])) for r in promos]
+
+    @staticmethod
+    def _norm(v) -> str | None:
+        """'Por cada' -> 'por_cada', 'Mayor o igual' -> 'mayor_o_igual'; sin acentos ni mayúsculas."""
+        if v is None or str(v).strip() == "":
+            return None
+        t = unicodedata.normalize("NFD", str(v).strip().lower())
+        t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+        return re.sub(r"[\s\-]+", "_", t)
+
+    _OPERADORES = {
+        "por_cada": "por_cada", "igual": "igual", "=": "igual", "==": "igual",
+        "mayor": "mayor", ">": "mayor",
+        "mayor_igual": "mayor_igual", "mayor_o_igual": "mayor_igual", ">=": "mayor_igual",
+        "menor": "menor", "<": "menor",
+        "menor_igual": "menor_igual", "menor_o_igual": "menor_igual", "<=": "menor_igual",
+    }
+
+    def _promo(self, r: dict, listas_precios_ids: list[str] | None = None) -> dict:
         acciones_raw  = (r.get("PromosAcciones__r")   or {}).get("records", [])
         condiciones_raw = (r.get("PromosCondiciones__r") or {}).get("records", [])
         return {
             "id":           r["Id"],
             "nombre":       r.get("Name"),
             "descripcion":  r.get("Descripcion__c"),
-            "estado":       r.get("Estado__c"),
-            "criterio":     r.get("Criterio__c"),
+            "estado":       r.get("Estado__c"),       # legado: siempre "Activa"
+            "criterio":     r.get("Criterio__c"),     # legado
             "fecha_inicio": r.get("FechaInicio__c"),
             "fecha_fin":    r.get("FechaFin__c"),
-            "acciones": [
-                {
-                    "id":          a["Id"],
-                    "nombre":      a.get("Name"),
-                    "producto_id": a.get("Product__c"),
-                    "cantidad":    a.get("Cantidad__c"),
-                    "tipo_medida": a.get("TipoMedida__c"),
-                }
-                for a in acciones_raw
-            ],
-            "condiciones": [
-                {
-                    "id":            c["Id"],
-                    "nombre":        c.get("Name"),
-                    "producto_id":   c.get("Producto__c"),
-                    "marca_id":      None,
-                    "capacidad":     c.get("Capacidad__c"),
-                    "presentacion":  c.get("Presentacion__c"),
-                    "operador":      c.get("Operador__c"),
-                    "tipo_medida":   c.get("TipoMedida__c"),
-                    "valor":         c.get("Valor__c"),
-                }
-                for c in condiciones_raw
-            ],
+            "listas_precios_ids":   listas_precios_ids or [],
+            "condiciones_relacion": "todas",
+            "acciones": [self._accion(a) for a in acciones_raw],
+            "condiciones": [self._condicion(c) for c in condiciones_raw],
+        }
+
+    def _accion(self, a: dict) -> dict:
+        tipo = self._norm(a.get("Tipo__c"))
+        tipo = {"bonificacion": "bonificacion", "descuento": "descuento"}.get(tipo)
+        # Sin Tipo__c: acción antigua, que era siempre una bonificación (producto + cantidad).
+        if tipo is None and a.get("Product__c"):
+            tipo = "bonificacion"
+        dtipo = {"porcentaje": "porcentaje", "monto": "monto"}.get(self._norm(a.get("Tipo_descuento__c")))
+        es_desc = tipo == "descuento"
+        return {
+            "id":          a["Id"],
+            "nombre":      a.get("Name"),
+            "tipo":        tipo,
+            "producto_id": a.get("Product__c"),
+            "cantidad":    a.get("Cantidad__c"),
+            # Unidad en que se bonifica: de TipoMedida__c (Unidades | Cajas). Por defecto unidades.
+            "unidad":      None if es_desc else ("cajas" if self._norm(a.get("TipoMedida__c")) in ("cajas", "caja") else "unidades"),
+            "tipo_medida": a.get("TipoMedida__c"),    # legado
+            "descuento_tipo":  dtipo if es_desc else None,
+            "descuento_valor": a.get("Valor_descuento__c") if es_desc else None,
+        }
+
+    def _condicion(self, c: dict) -> dict:
+        op = self._norm(c.get("Operador__c"))
+        med = self._norm(c.get("TipoMedida__c"))
+        med = {"unidades": "unidades", "unidad": "unidades", "cajas": "cajas", "caja": "cajas",
+               "monto": "monto", "montos": "monto"}.get(med, med)
+        return {
+            "id":          c["Id"],
+            "nombre":      c.get("Name"),
+            "producto_id": c.get("Producto__c"),
+            "marca":       None,
+            "categoria":   None,
+            "presentacion": c.get("Presentacion__c"),
+            "capacidad":   c.get("Capacidad__c"),
+            "medida":      med,
+            "operador":    self._OPERADORES.get(op, op),
+            "valor":       c.get("Valor__c"),
+            "marca_id":    None,                      # legado
+            "tipo_medida": c.get("TipoMedida__c"),    # legado
         }
 
     # ── Prospectos ────────────────────────────────────────────────────────────

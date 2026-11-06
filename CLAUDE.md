@@ -71,7 +71,7 @@ Para `experenta_crm`:
 | PUT    | /pedidos/{id}      | Actualizar pedido             |
 | GET    | /productos         | Productos activos con `marca`, `categoria`, `presentacion`, `capacidad`, `iva_porcentaje` (`Product2.IVA__c`), `unidades_por_caja` y `precios[]`: un elemento por lista de precios (no estándar) con `lista_precios_id`, `lista_precios`, `precio` (`UnitPrice`) y `precio_caja` (`List_Box_Price__c`). `precio` (nivel producto) se mantiene por compatibilidad y sale del Pricebook estándar. Requiere los campos nuevos de `Product2` y `PricebookEntry` legibles por la integración |
 | GET    | /productos/{id}    | Producto por ID (mismos atributos, sin `precios`) |
-| GET    | /promos            | Lista promociones             |
+| GET    | /promos            | Promociones activas y vigentes hoy (fecha en la zona del tenant), con `listas_precios_ids` (de la junction `Promocion_lista_precios__c`; vacío = todas las listas), `condiciones_relacion` ("todas"), `condiciones` (`medida` unidades/cajas/monto, `operador` normalizado por_cada/igual/mayor/mayor_igual/menor/menor_igual, `valor`, filtros) y `acciones` (`tipo` bonificacion/descuento, `cantidad`, `unidad` unidades/cajas desde `TipoMedida__c`, `descuento_tipo`, `descuento_valor`). Se mantienen los campos anteriores (`estado`, `criterio`, `tipo_medida`, `marca_id`). Requiere `Tipo__c`, `Tipo_descuento__c` y `Valor_descuento__c` en la acción y la junction con `Promocion__c` y `Price_Book__c` |
 | GET    | /prospectos        | Lista prospectos              |
 | POST   | /prospectos        | Crear prospecto               |
 | PUT    | /prospectos/{id}   | Actualizar prospecto          |
