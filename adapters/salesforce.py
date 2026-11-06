@@ -562,7 +562,10 @@ class SalesforceAdapter(CRMAdapter):
         if promos:
             for j in self.sf.query_all("SELECT Promocion__c, Price_Book__c FROM Promocion_lista_precios__c"):
                 listas.setdefault(j["Promocion__c"], []).append(j["Price_Book__c"])
-        return [self._promo(r, listas.get(r["Id"], [])) for r in promos]
+        resultado = [self._promo(r, listas.get(r["Id"], [])) for r in promos]
+        # Promo válida = al menos una condición y al menos una acción con tipo reconocido.
+        # Las incompletas no se envían a la app.
+        return [p for p in resultado if p["condiciones"] and any(a["tipo"] for a in p["acciones"])]
 
     @staticmethod
     def _norm(v) -> str | None:
