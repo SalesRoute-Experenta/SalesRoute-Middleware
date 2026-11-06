@@ -69,8 +69,8 @@ Para `experenta_crm`:
 | GET    | /pedidos/{id}      | Pedido por ID, si es de un cliente de la cartera del vendedor (404 si no) |
 | POST   | /pedidos           | Crear pedido. `cliente_id` debe ser un cliente de la cartera del vendedor (mismo filtro que `GET /clientes/{id}`); si no existe, es inválido o es ajeno: 404 "Cliente X no encontrado". Un 400 de Salesforce al crear sale como 400 `Dato inválido: ...` y no como 502 |
 | PUT    | /pedidos/{id}      | Actualizar pedido             |
-| GET    | /productos         | Lista productos               |
-| GET    | /productos/{id}    | Producto por ID               |
+| GET    | /productos         | Productos activos con `marca`, `categoria`, `presentacion`, `capacidad`, `iva_porcentaje` (`Product2.IVA__c`), `unidades_por_caja` y `precios[]`: un elemento por lista de precios (no estándar) con `lista_precios_id`, `lista_precios`, `precio` (`UnitPrice`) y `precio_caja` (`List_Box_Price__c`). `precio` (nivel producto) se mantiene por compatibilidad y sale del Pricebook estándar. Requiere los campos nuevos de `Product2` y `PricebookEntry` legibles por la integración |
+| GET    | /productos/{id}    | Producto por ID (mismos atributos, sin `precios`) |
 | GET    | /promos            | Lista promociones             |
 | GET    | /prospectos        | Lista prospectos              |
 | POST   | /prospectos        | Crear prospecto               |

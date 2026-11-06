@@ -289,30 +289,45 @@ class SalesforceAdapter(CRMAdapter):
 
     # ── Productos ─────────────────────────────────────────────────────────────
 
+    _PRODUCTO_FIELDS = (
+        "Id, Name, ProductCode, Description, Marca__c, Categoria__c, "
+        "Presentacion__c, Capacidad__c, IVA__c, Unidades_por_caja__c"
+    )
+
     def get_productos(self) -> list[dict]:
         records = self.sf.query_all(
-            "SELECT Id, Name, ProductCode, Description, IsActive FROM Product2 WHERE IsActive = true"
+            f"SELECT {self._PRODUCTO_FIELDS} FROM Product2 WHERE IsActive = true"
         )
         productos = [self._producto(r) for r in records]
 
-        # Enriquecer con precios del Pricebook estándar
-        try:
-            pb_id = self._get_standard_pricebook_id()
-            entries = self.sf.query(
-                f"SELECT Product2Id, UnitPrice FROM PricebookEntry "
-                f"WHERE Pricebook2Id = '{pb_id}' AND IsActive = true"
-            )
-            precio_map = {e["Product2Id"]: e["UnitPrice"] for e in entries.get("records", [])}
-            for p in productos:
-                p["precio"] = precio_map.get(p["id"])
-        except Exception:
-            pass
-
+        # Precios por lista: una entrada de `precios` por cada PricebookEntry activa.
+        # `precio` (campo anterior) sigue saliendo del Pricebook estándar.
+        entries = self.sf.query_all(
+            "SELECT Product2Id, Pricebook2Id, Pricebook2.Name, Pricebook2.IsStandard, "
+            "UnitPrice, List_Box_Price__c FROM PricebookEntry "
+            "WHERE IsActive = true AND Product2.IsActive = true"
+        )
+        por_producto: dict[str, list[dict]] = {}
+        estandar: dict[str, float] = {}
+        for e in entries:
+            pb = e.get("Pricebook2") or {}
+            if pb.get("IsStandard"):
+                estandar[e["Product2Id"]] = e.get("UnitPrice")
+                continue
+            por_producto.setdefault(e["Product2Id"], []).append({
+                "lista_precios_id": e.get("Pricebook2Id"),
+                "lista_precios":    pb.get("Name"),
+                "precio":           e.get("UnitPrice"),
+                "precio_caja":      e.get("List_Box_Price__c"),
+            })
+        for p in productos:
+            p["precios"] = por_producto.get(p["id"], [])
+            p["precio"] = estandar.get(p["id"])
         return productos
 
     def get_producto(self, record_id: str) -> dict:
         data = self.sf.query(
-            f"SELECT Id, Name, ProductCode, Description FROM Product2 WHERE Id = '{_safe_id(record_id)}' LIMIT 1"
+            f"SELECT {self._PRODUCTO_FIELDS} FROM Product2 WHERE Id = '{_safe_id(record_id)}' LIMIT 1"
         )
         records = data.get("records", [])
         if not records:
@@ -321,10 +336,16 @@ class SalesforceAdapter(CRMAdapter):
 
     def _producto(self, r: dict) -> dict:
         return {
-            "id":          r["Id"],
-            "nombre":      r.get("Name"),
-            "codigo":      r.get("ProductCode"),
-            "descripcion": r.get("Description"),
+            "id":               r["Id"],
+            "nombre":           r.get("Name"),
+            "codigo":           r.get("ProductCode"),
+            "descripcion":      r.get("Description"),
+            "marca":            r.get("Marca__c"),
+            "categoria":        r.get("Categoria__c"),
+            "presentacion":     r.get("Presentacion__c"),
+            "capacidad":        r.get("Capacidad__c"),
+            "iva_porcentaje":   r.get("IVA__c"),
+            "unidades_por_caja": r.get("Unidades_por_caja__c"),
         }
 
     # ── Solicitudes ───────────────────────────────────────────────────────────
