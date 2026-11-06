@@ -81,3 +81,11 @@ class SalesforceClient:
             timeout=15,
         )
         resp.raise_for_status()
+
+    def delete(self, sobject: str, record_id: str):
+        resp = requests.delete(
+            f"{self._base()}/sobjects/{sobject}/{record_id}",
+            headers=self._headers(),
+            timeout=15,
+        )
+        resp.raise_for_status()

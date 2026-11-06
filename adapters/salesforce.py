@@ -1,5 +1,7 @@
 import re
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from requests.exceptions import HTTPError
 
@@ -95,7 +97,7 @@ class SalesforceAdapter(CRMAdapter):
         "Id, Name, Nombre_de_negocio__c, Phone, Id_Externo__c, ParentId, "
         "ShippingStreet, ShippingCity, ShippingState, ShippingPostalCode, ShippingCountry, "
         "ShippingLatitude, ShippingLongitude, "
-        "Dias_de_visita__c"
+        "Dias_de_visita__c, Price_Book__c, Price_Book__r.Name"
     )
 
     # La cartera del vendedor son las cuentas activas de sus módulos (Account.Modulo__c).
@@ -140,13 +142,18 @@ class SalesforceAdapter(CRMAdapter):
             "lat":         r.get("ShippingLatitude"),
             "lng":         r.get("ShippingLongitude"),
             "dias_visita": dias,
+            # Lista de precios del cliente (Pricebook2). null = sin lista: la app no le permite crear pedidos.
+            "lista_precios_id": r.get("Price_Book__c"),
+            "lista_precios":    (r.get("Price_Book__r") or {}).get("Name"),
         }
 
     # ── Pedidos ───────────────────────────────────────────────────────────────
 
     _PEDIDO_FIELDS = (
         "Id, OrderNumber, Status, TotalAmount, AccountId, EffectiveDate, CreatedDate, "
-        "(SELECT Product2Id, Product2.Name, Quantity, UnitPrice, TotalPrice FROM OrderItems)"
+        "Subtotal__c, Descuento__c, IVA__c, Total__c, "
+        "(SELECT Product2Id, Product2.Name, Quantity, UnitPrice, TotalPrice, Descuento__c, "
+        "IVA_porcentaje__c, IVA__c, Total__c, Bonificacion__c, Promocion__c, Valor_lista__c FROM OrderItems)"
     )
 
     # Los pedidos del vendedor son los de los clientes de su cartera (mismo filtro que /clientes).
@@ -177,6 +184,8 @@ class SalesforceAdapter(CRMAdapter):
         from datetime import date
         if not data.get("cliente_id"):
             raise ValueError("Campo requerido: cliente_id")
+        if "lineas" in data:
+            return self._crear_pedido_validado(vendedor_id, data)
         self._validar_cliente_en_cartera(vendedor_id, data["cliente_id"])
         pricebook_id = data.get("pricebook_id") or self._get_standard_pricebook_id()
         order_payload = {
@@ -218,6 +227,156 @@ class SalesforceAdapter(CRMAdapter):
             estado = "Draft"
 
         return {"id": order_id, "estado": estado, "cliente_id": data["cliente_id"], "total": total}
+
+    # ── POST /pedidos con totales (contrato nuevo, `lineas`) ──────────────────
+
+    _TIPOS_PEDIDO = ("nuevo", "cambio", "devolucion")
+
+    @staticmethod
+    def _dec(v, campo: str) -> Decimal:
+        if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+            raise ValueError(f"Dato inválido: {campo} debe ser un número")
+        try:
+            d = Decimal(str(v))
+        except InvalidOperation:
+            raise ValueError(f"Dato inválido: {campo} debe ser un número") from None
+        if not d.is_finite():
+            raise ValueError(f"Dato inválido: {campo} debe ser un número")
+        return d
+
+    @staticmethod
+    def _r2(d: Decimal) -> Decimal:
+        return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def _crear_pedido_validado(self, vendedor_id: str | None, data: dict) -> dict:
+        cliente_id = data["cliente_id"]
+        cliente = self._cliente_de_cartera(vendedor_id, cliente_id)
+        lista = cliente.get("Price_Book__c")
+        if not lista:
+            raise ValueError("Dato inválido: el cliente no tiene lista de precios")
+        if data.get("lista_precios_id") != lista:
+            raise ValueError("Dato inválido: lista_precios_id no es la lista de precios del cliente")
+        tipo = data.get("tipo")
+        if tipo is not None and tipo not in self._TIPOS_PEDIDO:
+            raise ValueError("Dato inválido: tipo debe ser nuevo, cambio o devolucion")
+        fecha = data.get("fecha") or date.today().isoformat()
+        if not isinstance(fecha, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", fecha):
+            raise ValueError("Dato inválido: fecha debe ser YYYY-MM-DD")
+        lineas = data.get("lineas")
+        if not isinstance(lineas, list) or not lineas:
+            raise ValueError("Campo requerido: lineas")
+
+        # Datos de Salesforce contra los que se valida: precio de lista, IVA del producto y promos vigentes
+        ids = []
+        for i, l in enumerate(lineas, 1):
+            pid = l.get("producto_id") if isinstance(l, dict) else None
+            if not isinstance(pid, str) or not _SF_ID_RE.match(pid):
+                raise ValueError(f"Dato inválido: línea {i}: producto_id inválido")
+            if pid not in ids:
+                ids.append(pid)
+        in_ids = ", ".join(f"'{x}'" for x in ids)
+        entradas = {e["Product2Id"]: e for e in self.sf.query_all(
+            f"SELECT Id, Product2Id, UnitPrice FROM PricebookEntry "
+            f"WHERE Pricebook2Id = '{lista}' AND IsActive = true AND Product2Id IN ({in_ids})")}
+        iva_prod = {p["Id"]: p.get("IVA__c") for p in self.sf.query_all(
+            f"SELECT Id, IVA__c FROM Product2 WHERE Id IN ({in_ids})")}
+        promo_ids = sorted({l["promo_id"] for l in lineas if l.get("promo_id")})
+        vigentes: set[str] = set()
+        if promo_ids:
+            in_promos = ", ".join(f"'{_safe_id(x)}'" for x in promo_ids)
+            hoy = datetime.now(self.zona).date().isoformat()
+            vigentes = {p["Id"] for p in self.sf.query_all(
+                "SELECT Id FROM Promocion__c WHERE Estado__c = 'Activa' "
+                f"AND (FechaInicio__c = null OR FechaInicio__c <= {hoy}) AND (FechaFin__c = null OR FechaFin__c >= {hoy}) "
+                f"AND Id IN ({in_promos})")}
+
+        cero = Decimal("0.00")
+        t_sub = t_desc = t_iva = cero
+        filas = []
+        for i, l in enumerate(lineas, 1):
+            n = f"línea {i}"
+            pid = l["producto_id"]
+            entrada = entradas.get(pid)
+            if not entrada:
+                raise ValueError(f"Dato inválido: {n}: el producto {pid} no tiene precio en la lista del cliente")
+            cant = self._dec(l.get("cantidad"), f"{n}: cantidad")
+            if cant <= 0 or cant != cant.to_integral_value():
+                raise ValueError(f"Dato inválido: {n}: cantidad debe ser un entero mayor que 0")
+            bonif = bool(l.get("bonificacion"))
+            precio_lista = self._dec(entrada["UnitPrice"], "UnitPrice")
+            precio = self._dec(l.get("precio_unitario"), f"{n}: precio_unitario")
+            if precio != (cero if bonif else precio_lista):
+                esperado = "0 en una bonificación" if bonif else f"{precio_lista} (precio de la lista)"
+                raise ValueError(f"Dato inválido: {n}: precio_unitario debe ser {esperado}")
+            promo = l.get("promo_id")
+            if promo and promo not in vigentes:
+                raise ValueError(f"Dato inválido: {n}: promo {promo} no existe o no está vigente")
+            if bonif and not promo:
+                raise ValueError(f"Dato inválido: {n}: una bonificación requiere promo_id")
+            pct = self._dec(l.get("iva_porcentaje"), f"{n}: iva_porcentaje")
+            if iva_prod.get(pid) is not None and pct != self._dec(iva_prod[pid], "IVA__c"):
+                raise ValueError(f"Dato inválido: {n}: iva_porcentaje no coincide con el del producto")
+            subtotal = self._r2(precio * cant)
+            desc = self._dec(l.get("descuento", 0), f"{n}: descuento")
+            if desc < 0 or desc > subtotal or (bonif and desc != 0):
+                raise ValueError(f"Dato inválido: {n}: descuento fuera de rango")
+            iva = cero if bonif else self._r2((subtotal - desc) * pct / 100)
+            total = subtotal - desc + iva
+            valor_lista = None
+            if bonif:
+                valor_lista = self._r2(precio_lista * cant)
+                if l.get("valor_lista") is not None and self._dec(l["valor_lista"], f"{n}: valor_lista") != valor_lista:
+                    raise ValueError(f"Dato inválido: {n}: valor_lista debe ser {valor_lista}")
+            for campo, calc in (("subtotal", subtotal), ("iva", iva), ("total", total)):
+                if self._dec(l.get(campo), f"{n}: {campo}") != calc:
+                    raise ValueError(f"Dato inválido: {n}: {campo} debe ser {calc}")
+            t_sub += subtotal
+            t_desc += desc
+            t_iva += iva
+            filas.append({"pid": pid, "entry": entrada["Id"], "cant": cant, "precio": precio, "desc": desc, "pct": pct,
+                          "iva": iva, "total": total, "bonif": bonif, "promo": promo, "valor_lista": valor_lista})
+        t_total = t_sub - t_desc + t_iva
+        for campo, calc in (("subtotal", t_sub), ("descuento", t_desc), ("iva", t_iva), ("total", t_total)):
+            if self._dec(data.get(campo), campo) != calc:
+                raise ValueError(f"Dato inválido: {campo} del pedido debe ser {calc}")
+
+        # Sin transacción multi-objeto en este flujo: si falla una línea se borra el pedido (todo o nada).
+        order_id = self._crear("Order", {
+            "AccountId": cliente_id, "Status": "Draft", "EffectiveDate": fecha, "Pricebook2Id": lista,
+            "Subtotal__c": float(t_sub), "Descuento__c": float(t_desc), "IVA__c": float(t_iva), "Total__c": float(t_total),
+        })["id"]
+        try:
+            for f in filas:
+                item = {
+                    "OrderId": order_id, "Product2Id": f["pid"], "PricebookEntryId": f["entry"],
+                    "Quantity": int(f["cant"]), "UnitPrice": float(f["precio"]),
+                    "Descuento__c": float(f["desc"]), "IVA_porcentaje__c": float(f["pct"]),
+                    "IVA__c": float(f["iva"]), "Total__c": float(f["total"]), "Bonificacion__c": f["bonif"],
+                }
+                if f["promo"]:
+                    item["Promocion__c"] = f["promo"]
+                if f["valor_lista"] is not None:
+                    item["Valor_lista__c"] = float(f["valor_lista"])
+                self._crear("OrderItem", item)
+            self.sf.update("Order", order_id, {"Status": "Activated"})
+        except Exception:
+            try:
+                self.sf.delete("Order", order_id)
+            except Exception:
+                pass
+            raise
+        recs = self.sf.query(f"SELECT OrderNumber FROM Order WHERE Id = '{order_id}'").get("records") or [{}]
+        return {"id": order_id, "numero": recs[0].get("OrderNumber"), "estado": "Activated",
+                "id_local": data.get("id_local"), "total": float(t_total)}
+
+    def _cliente_de_cartera(self, vendedor_id: str | None, cliente_id) -> dict:
+        cartera = self._cartera(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulos
+        if not isinstance(cliente_id, str) or not _SF_ID_RE.match(cliente_id):
+            raise ValueError(f"Cliente {cliente_id} no encontrado")
+        recs = self.sf.query(f"SELECT Id, Price_Book__c FROM Account WHERE Id = '{cliente_id}' AND {cartera} LIMIT 1").get("records")
+        if not recs:
+            raise ValueError(f"Cliente {cliente_id} no encontrado")
+        return recs[0]
 
     def _validar_cliente_en_cartera(self, vendedor_id: str | None, cliente_id) -> None:
         # Un pedido solo se crea para un cliente de la cartera del vendedor (mismo filtro que GET /clientes/{id}).
@@ -268,7 +427,11 @@ class SalesforceAdapter(CRMAdapter):
             "id":         r["Id"],
             "numero":     r.get("OrderNumber"),
             "estado":     r.get("Status"),
-            "total":      r.get("TotalAmount"),
+            # Total__c = total real (con descuento e IVA); TotalAmount de Salesforce es solo Σ precio × cantidad.
+            "total":      r.get("Total__c") if r.get("Total__c") is not None else r.get("TotalAmount"),
+            "subtotal":   r.get("Subtotal__c"),
+            "descuento":  r.get("Descuento__c"),
+            "iva":        r.get("IVA__c"),
             "cliente_id": r.get("AccountId"),
             "fecha":          r.get("EffectiveDate"),
             "fecha_creacion": r.get("CreatedDate"),
@@ -278,7 +441,13 @@ class SalesforceAdapter(CRMAdapter):
                     "producto_nombre": (i.get("Product2") or {}).get("Name"),
                     "cantidad":        i.get("Quantity"),
                     "precio_unitario": i.get("UnitPrice"),
-                    "total":           i.get("TotalPrice"),
+                    "total":           i.get("Total__c") if i.get("Total__c") is not None else i.get("TotalPrice"),
+                    "descuento":       i.get("Descuento__c"),
+                    "iva_porcentaje":  i.get("IVA_porcentaje__c"),
+                    "iva":             i.get("IVA__c"),
+                    "bonificacion":    bool(i.get("Bonificacion__c")),
+                    "promo_id":        i.get("Promocion__c"),
+                    "valor_lista":     i.get("Valor_lista__c"),
                 }
                 for i in items
             ],
@@ -286,30 +455,44 @@ class SalesforceAdapter(CRMAdapter):
 
     # ── Productos ─────────────────────────────────────────────────────────────
 
+    _PRODUCTO_FIELDS = (
+        "Id, Name, ProductCode, Description, Marca__c, Categoria__c, "
+        "Presentacion__c, Capacidad__c, IVA__c, Unidades_por_caja__c"
+    )
+
     def get_productos(self) -> list[dict]:
         records = self.sf.query_all(
-            "SELECT Id, Name, ProductCode, Description, IsActive FROM Product2 WHERE IsActive = true"
+            f"SELECT {self._PRODUCTO_FIELDS} FROM Product2 WHERE IsActive = true"
         )
         productos = [self._producto(r) for r in records]
 
-        # Enriquecer con precios del Pricebook estándar
-        try:
-            pb_id = self._get_standard_pricebook_id()
-            entries = self.sf.query(
-                f"SELECT Product2Id, UnitPrice FROM PricebookEntry "
-                f"WHERE Pricebook2Id = '{pb_id}' AND IsActive = true"
-            )
-            precio_map = {e["Product2Id"]: e["UnitPrice"] for e in entries.get("records", [])}
-            for p in productos:
-                p["precio"] = precio_map.get(p["id"])
-        except Exception:
-            pass
-
+        # Precios por lista: una entrada de `precios` por cada PricebookEntry activa (incluida la estándar).
+        # `precio` (campo anterior) sigue saliendo del Pricebook estándar.
+        entries = self.sf.query_all(
+            "SELECT Product2Id, Pricebook2Id, Pricebook2.Name, Pricebook2.IsStandard, "
+            "UnitPrice, List_Box_Price__c FROM PricebookEntry "
+            "WHERE IsActive = true AND Product2.IsActive = true"
+        )
+        por_producto: dict[str, list[dict]] = {}
+        estandar: dict[str, float] = {}
+        for e in entries:
+            pb = e.get("Pricebook2") or {}
+            if pb.get("IsStandard"):
+                estandar[e["Product2Id"]] = e.get("UnitPrice")   # y también sale en precios[]: un cliente puede tener asignado el estándar
+            por_producto.setdefault(e["Product2Id"], []).append({
+                "lista_precios_id": e.get("Pricebook2Id"),
+                "lista_precios":    pb.get("Name"),
+                "precio":           e.get("UnitPrice"),
+                "precio_caja":      e.get("List_Box_Price__c"),
+            })
+        for p in productos:
+            p["precios"] = por_producto.get(p["id"], [])
+            p["precio"] = estandar.get(p["id"])
         return productos
 
     def get_producto(self, record_id: str) -> dict:
         data = self.sf.query(
-            f"SELECT Id, Name, ProductCode, Description FROM Product2 WHERE Id = '{_safe_id(record_id)}' LIMIT 1"
+            f"SELECT {self._PRODUCTO_FIELDS} FROM Product2 WHERE Id = '{_safe_id(record_id)}' LIMIT 1"
         )
         records = data.get("records", [])
         if not records:
@@ -318,10 +501,16 @@ class SalesforceAdapter(CRMAdapter):
 
     def _producto(self, r: dict) -> dict:
         return {
-            "id":          r["Id"],
-            "nombre":      r.get("Name"),
-            "codigo":      r.get("ProductCode"),
-            "descripcion": r.get("Description"),
+            "id":               r["Id"],
+            "nombre":           r.get("Name"),
+            "codigo":           r.get("ProductCode"),
+            "descripcion":      r.get("Description"),
+            "marca":            r.get("Marca__c"),
+            "categoria":        r.get("Categoria__c"),
+            "presentacion":     r.get("Presentacion__c"),
+            "capacidad":        r.get("Capacidad__c"),
+            "iva_porcentaje":   r.get("IVA__c"),
+            "unidades_por_caja": r.get("Unidades_por_caja__c"),
         }
 
     # ── Solicitudes ───────────────────────────────────────────────────────────
@@ -353,51 +542,103 @@ class SalesforceAdapter(CRMAdapter):
     # ── Promos ────────────────────────────────────────────────────────────────
 
     def get_promos(self) -> list[dict]:
+        # Solo activas y vigentes hoy (fecha en la zona horaria del tenant).
+        hoy = datetime.now(self.zona).date().isoformat()
         data = self.sf.query(
             "SELECT Id, Name, Descripcion__c, Estado__c, Criterio__c, "
             "FechaInicio__c, FechaFin__c, "
-            "(SELECT Id, Name, Product__c, Cantidad__c, TipoMedida__c FROM PromosAcciones__r), "
+            "(SELECT Id, Name, Product__c, Cantidad__c, TipoMedida__c, "
+            "Tipo__c, Tipo_descuento__c, Valor_descuento__c FROM PromosAcciones__r), "
             "(SELECT Id, Name, Producto__c, Capacidad__c, Presentacion__c, "
             "Operador__c, TipoMedida__c, Valor__c FROM PromosCondiciones__r) "
-            "FROM Promocion__c WHERE Estado__c = 'Activa'"
+            "FROM Promocion__c WHERE Estado__c = 'Activa' "
+            f"AND (FechaInicio__c = null OR FechaInicio__c <= {hoy}) "
+            f"AND (FechaFin__c = null OR FechaFin__c >= {hoy})"
         )
-        return [self._promo(r) for r in data.get("records", [])]
+        promos = data.get("records", [])
 
-    def _promo(self, r: dict) -> dict:
+        # Listas de precios por promo (junction). Sin filas = aplica a todas las listas.
+        listas: dict[str, list[str]] = {}
+        if promos:
+            for j in self.sf.query_all("SELECT Promocion__c, Price_Book__c FROM Promocion_lista_precios__c"):
+                listas.setdefault(j["Promocion__c"], []).append(j["Price_Book__c"])
+        return [self._promo(r, listas.get(r["Id"], [])) for r in promos]
+
+    @staticmethod
+    def _norm(v) -> str | None:
+        """'Por cada' -> 'por_cada', 'Mayor o igual' -> 'mayor_o_igual'; sin acentos ni mayúsculas."""
+        if v is None or str(v).strip() == "":
+            return None
+        t = unicodedata.normalize("NFD", str(v).strip().lower())
+        t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+        return re.sub(r"[\s\-]+", "_", t)
+
+    _OPERADORES = {
+        "por_cada": "por_cada", "igual": "igual", "=": "igual", "==": "igual",
+        "mayor": "mayor", ">": "mayor",
+        "mayor_igual": "mayor_igual", "mayor_o_igual": "mayor_igual", ">=": "mayor_igual",
+        "menor": "menor", "<": "menor",
+        "menor_igual": "menor_igual", "menor_o_igual": "menor_igual", "<=": "menor_igual",
+    }
+
+    def _promo(self, r: dict, listas_precios_ids: list[str] | None = None) -> dict:
         acciones_raw  = (r.get("PromosAcciones__r")   or {}).get("records", [])
         condiciones_raw = (r.get("PromosCondiciones__r") or {}).get("records", [])
         return {
             "id":           r["Id"],
             "nombre":       r.get("Name"),
             "descripcion":  r.get("Descripcion__c"),
-            "estado":       r.get("Estado__c"),
-            "criterio":     r.get("Criterio__c"),
+            "estado":       r.get("Estado__c"),       # legado: siempre "Activa"
+            "criterio":     r.get("Criterio__c"),     # legado
             "fecha_inicio": r.get("FechaInicio__c"),
             "fecha_fin":    r.get("FechaFin__c"),
-            "acciones": [
-                {
-                    "id":          a["Id"],
-                    "nombre":      a.get("Name"),
-                    "producto_id": a.get("Product__c"),
-                    "cantidad":    a.get("Cantidad__c"),
-                    "tipo_medida": a.get("TipoMedida__c"),
-                }
-                for a in acciones_raw
-            ],
-            "condiciones": [
-                {
-                    "id":            c["Id"],
-                    "nombre":        c.get("Name"),
-                    "producto_id":   c.get("Producto__c"),
-                    "marca_id":      None,
-                    "capacidad":     c.get("Capacidad__c"),
-                    "presentacion":  c.get("Presentacion__c"),
-                    "operador":      c.get("Operador__c"),
-                    "tipo_medida":   c.get("TipoMedida__c"),
-                    "valor":         c.get("Valor__c"),
-                }
-                for c in condiciones_raw
-            ],
+            "listas_precios_ids":   listas_precios_ids or [],
+            "condiciones_relacion": "todas",
+            "acciones": [self._accion(a) for a in acciones_raw],
+            "condiciones": [self._condicion(c) for c in condiciones_raw],
+        }
+
+    def _accion(self, a: dict) -> dict:
+        tipo = self._norm(a.get("Tipo__c"))
+        tipo = {"bonificacion": "bonificacion", "descuento": "descuento"}.get(tipo)
+        # Sin Tipo__c: acción antigua, que era siempre una bonificación (producto + cantidad).
+        if tipo is None and a.get("Product__c"):
+            tipo = "bonificacion"
+        dtipo = {"porcentaje": "porcentaje", "monto": "monto"}.get(self._norm(a.get("Tipo_descuento__c")))
+        es_desc = tipo == "descuento"
+        return {
+            "id":          a["Id"],
+            "nombre":      a.get("Name"),
+            "tipo":        tipo,
+            "producto_id": a.get("Product__c"),
+            "cantidad":    a.get("Cantidad__c"),
+            # Unidad en que se bonifica: de TipoMedida__c (Unidades | Cajas). Por defecto unidades.
+            "unidad":      ("cajas" if self._norm(a.get("TipoMedida__c")) in ("cajas", "caja") else "unidades") if tipo == "bonificacion" else None,
+            "tipo_medida": a.get("TipoMedida__c"),    # legado
+            "descuento_tipo":  dtipo if es_desc else None,
+            "descuento_valor": a.get("Valor_descuento__c") if es_desc else None,
+        }
+
+    def _condicion(self, c: dict) -> dict:
+        op = self._norm(c.get("Operador__c"))
+        if op and op.endswith("_que"):   # "Mayor o igual que" -> mayor_o_igual
+            op = op[:-4]
+        med = self._norm(c.get("TipoMedida__c"))
+        med = {"unidades": "unidades", "unidad": "unidades", "cajas": "cajas", "caja": "cajas",
+               "monto": "monto", "montos": "monto"}.get(med, med)
+        return {
+            "id":          c["Id"],
+            "nombre":      c.get("Name"),
+            "producto_id": c.get("Producto__c"),
+            "marca":       None,
+            "categoria":   None,
+            "presentacion": c.get("Presentacion__c"),
+            "capacidad":   c.get("Capacidad__c"),
+            "medida":      med,
+            "operador":    self._OPERADORES.get(op, op),
+            "valor":       c.get("Valor__c"),
+            "marca_id":    None,                      # legado
+            "tipo_medida": c.get("TipoMedida__c"),    # legado
         }
 
     # ── Prospectos ────────────────────────────────────────────────────────────
