@@ -1,6 +1,7 @@
 import re
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from requests.exceptions import HTTPError
 
@@ -150,7 +151,9 @@ class SalesforceAdapter(CRMAdapter):
 
     _PEDIDO_FIELDS = (
         "Id, OrderNumber, Status, TotalAmount, AccountId, EffectiveDate, CreatedDate, "
-        "(SELECT Product2Id, Product2.Name, Quantity, UnitPrice, TotalPrice FROM OrderItems)"
+        "Subtotal__c, Descuento__c, IVA__c, Total__c, "
+        "(SELECT Product2Id, Product2.Name, Quantity, UnitPrice, TotalPrice, Descuento__c, "
+        "IVA_porcentaje__c, IVA__c, Total__c, Bonificacion__c, Promocion__c, Valor_lista__c FROM OrderItems)"
     )
 
     # Los pedidos del vendedor son los de los clientes de su cartera (mismo filtro que /clientes).
@@ -181,6 +184,8 @@ class SalesforceAdapter(CRMAdapter):
         from datetime import date
         if not data.get("cliente_id"):
             raise ValueError("Campo requerido: cliente_id")
+        if "lineas" in data:
+            return self._crear_pedido_validado(vendedor_id, data)
         self._validar_cliente_en_cartera(vendedor_id, data["cliente_id"])
         pricebook_id = data.get("pricebook_id") or self._get_standard_pricebook_id()
         order_payload = {
@@ -222,6 +227,156 @@ class SalesforceAdapter(CRMAdapter):
             estado = "Draft"
 
         return {"id": order_id, "estado": estado, "cliente_id": data["cliente_id"], "total": total}
+
+    # ── POST /pedidos con totales (contrato nuevo, `lineas`) ──────────────────
+
+    _TIPOS_PEDIDO = ("nuevo", "cambio", "devolucion")
+
+    @staticmethod
+    def _dec(v, campo: str) -> Decimal:
+        if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+            raise ValueError(f"Dato inválido: {campo} debe ser un número")
+        try:
+            d = Decimal(str(v))
+        except InvalidOperation:
+            raise ValueError(f"Dato inválido: {campo} debe ser un número") from None
+        if not d.is_finite():
+            raise ValueError(f"Dato inválido: {campo} debe ser un número")
+        return d
+
+    @staticmethod
+    def _r2(d: Decimal) -> Decimal:
+        return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def _crear_pedido_validado(self, vendedor_id: str | None, data: dict) -> dict:
+        cliente_id = data["cliente_id"]
+        cliente = self._cliente_de_cartera(vendedor_id, cliente_id)
+        lista = cliente.get("Price_Book__c")
+        if not lista:
+            raise ValueError("Dato inválido: el cliente no tiene lista de precios")
+        if data.get("lista_precios_id") != lista:
+            raise ValueError("Dato inválido: lista_precios_id no es la lista de precios del cliente")
+        tipo = data.get("tipo")
+        if tipo is not None and tipo not in self._TIPOS_PEDIDO:
+            raise ValueError("Dato inválido: tipo debe ser nuevo, cambio o devolucion")
+        fecha = data.get("fecha") or date.today().isoformat()
+        if not isinstance(fecha, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", fecha):
+            raise ValueError("Dato inválido: fecha debe ser YYYY-MM-DD")
+        lineas = data.get("lineas")
+        if not isinstance(lineas, list) or not lineas:
+            raise ValueError("Campo requerido: lineas")
+
+        # Datos de Salesforce contra los que se valida: precio de lista, IVA del producto y promos vigentes
+        ids = []
+        for i, l in enumerate(lineas, 1):
+            pid = l.get("producto_id") if isinstance(l, dict) else None
+            if not isinstance(pid, str) or not _SF_ID_RE.match(pid):
+                raise ValueError(f"Dato inválido: línea {i}: producto_id inválido")
+            if pid not in ids:
+                ids.append(pid)
+        in_ids = ", ".join(f"'{x}'" for x in ids)
+        entradas = {e["Product2Id"]: e for e in self.sf.query_all(
+            f"SELECT Id, Product2Id, UnitPrice FROM PricebookEntry "
+            f"WHERE Pricebook2Id = '{lista}' AND IsActive = true AND Product2Id IN ({in_ids})")}
+        iva_prod = {p["Id"]: p.get("IVA__c") for p in self.sf.query_all(
+            f"SELECT Id, IVA__c FROM Product2 WHERE Id IN ({in_ids})")}
+        promo_ids = sorted({l["promo_id"] for l in lineas if l.get("promo_id")})
+        vigentes: set[str] = set()
+        if promo_ids:
+            in_promos = ", ".join(f"'{_safe_id(x)}'" for x in promo_ids)
+            hoy = datetime.now(self.zona).date().isoformat()
+            vigentes = {p["Id"] for p in self.sf.query_all(
+                "SELECT Id FROM Promocion__c WHERE Estado__c = 'Activa' "
+                f"AND (FechaInicio__c = null OR FechaInicio__c <= {hoy}) AND (FechaFin__c = null OR FechaFin__c >= {hoy}) "
+                f"AND Id IN ({in_promos})")}
+
+        cero = Decimal("0.00")
+        t_sub = t_desc = t_iva = cero
+        filas = []
+        for i, l in enumerate(lineas, 1):
+            n = f"línea {i}"
+            pid = l["producto_id"]
+            entrada = entradas.get(pid)
+            if not entrada:
+                raise ValueError(f"Dato inválido: {n}: el producto {pid} no tiene precio en la lista del cliente")
+            cant = self._dec(l.get("cantidad"), f"{n}: cantidad")
+            if cant <= 0 or cant != cant.to_integral_value():
+                raise ValueError(f"Dato inválido: {n}: cantidad debe ser un entero mayor que 0")
+            bonif = bool(l.get("bonificacion"))
+            precio_lista = self._dec(entrada["UnitPrice"], "UnitPrice")
+            precio = self._dec(l.get("precio_unitario"), f"{n}: precio_unitario")
+            if precio != (cero if bonif else precio_lista):
+                esperado = "0 en una bonificación" if bonif else f"{precio_lista} (precio de la lista)"
+                raise ValueError(f"Dato inválido: {n}: precio_unitario debe ser {esperado}")
+            promo = l.get("promo_id")
+            if promo and promo not in vigentes:
+                raise ValueError(f"Dato inválido: {n}: promo {promo} no existe o no está vigente")
+            if bonif and not promo:
+                raise ValueError(f"Dato inválido: {n}: una bonificación requiere promo_id")
+            pct = self._dec(l.get("iva_porcentaje"), f"{n}: iva_porcentaje")
+            if iva_prod.get(pid) is not None and pct != self._dec(iva_prod[pid], "IVA__c"):
+                raise ValueError(f"Dato inválido: {n}: iva_porcentaje no coincide con el del producto")
+            subtotal = self._r2(precio * cant)
+            desc = self._dec(l.get("descuento", 0), f"{n}: descuento")
+            if desc < 0 or desc > subtotal or (bonif and desc != 0):
+                raise ValueError(f"Dato inválido: {n}: descuento fuera de rango")
+            iva = cero if bonif else self._r2((subtotal - desc) * pct / 100)
+            total = subtotal - desc + iva
+            valor_lista = None
+            if bonif:
+                valor_lista = self._r2(precio_lista * cant)
+                if l.get("valor_lista") is not None and self._dec(l["valor_lista"], f"{n}: valor_lista") != valor_lista:
+                    raise ValueError(f"Dato inválido: {n}: valor_lista debe ser {valor_lista}")
+            for campo, calc in (("subtotal", subtotal), ("iva", iva), ("total", total)):
+                if self._dec(l.get(campo), f"{n}: {campo}") != calc:
+                    raise ValueError(f"Dato inválido: {n}: {campo} debe ser {calc}")
+            t_sub += subtotal
+            t_desc += desc
+            t_iva += iva
+            filas.append({"pid": pid, "entry": entrada["Id"], "cant": cant, "precio": precio, "desc": desc, "pct": pct,
+                          "iva": iva, "total": total, "bonif": bonif, "promo": promo, "valor_lista": valor_lista})
+        t_total = t_sub - t_desc + t_iva
+        for campo, calc in (("subtotal", t_sub), ("descuento", t_desc), ("iva", t_iva), ("total", t_total)):
+            if self._dec(data.get(campo), campo) != calc:
+                raise ValueError(f"Dato inválido: {campo} del pedido debe ser {calc}")
+
+        # Sin transacción multi-objeto en este flujo: si falla una línea se borra el pedido (todo o nada).
+        order_id = self._crear("Order", {
+            "AccountId": cliente_id, "Status": "Draft", "EffectiveDate": fecha, "Pricebook2Id": lista,
+            "Subtotal__c": float(t_sub), "Descuento__c": float(t_desc), "IVA__c": float(t_iva), "Total__c": float(t_total),
+        })["id"]
+        try:
+            for f in filas:
+                item = {
+                    "OrderId": order_id, "Product2Id": f["pid"], "PricebookEntryId": f["entry"],
+                    "Quantity": int(f["cant"]), "UnitPrice": float(f["precio"]),
+                    "Descuento__c": float(f["desc"]), "IVA_porcentaje__c": float(f["pct"]),
+                    "IVA__c": float(f["iva"]), "Total__c": float(f["total"]), "Bonificacion__c": f["bonif"],
+                }
+                if f["promo"]:
+                    item["Promocion__c"] = f["promo"]
+                if f["valor_lista"] is not None:
+                    item["Valor_lista__c"] = float(f["valor_lista"])
+                self._crear("OrderItem", item)
+            self.sf.update("Order", order_id, {"Status": "Activated"})
+        except Exception:
+            try:
+                self.sf.delete("Order", order_id)
+            except Exception:
+                pass
+            raise
+        recs = self.sf.query(f"SELECT OrderNumber FROM Order WHERE Id = '{order_id}'").get("records") or [{}]
+        return {"id": order_id, "numero": recs[0].get("OrderNumber"), "estado": "Activated",
+                "id_local": data.get("id_local"), "total": float(t_total)}
+
+    def _cliente_de_cartera(self, vendedor_id: str | None, cliente_id) -> dict:
+        cartera = self._cartera(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulos
+        if not isinstance(cliente_id, str) or not _SF_ID_RE.match(cliente_id):
+            raise ValueError(f"Cliente {cliente_id} no encontrado")
+        recs = self.sf.query(f"SELECT Id, Price_Book__c FROM Account WHERE Id = '{cliente_id}' AND {cartera} LIMIT 1").get("records")
+        if not recs:
+            raise ValueError(f"Cliente {cliente_id} no encontrado")
+        return recs[0]
 
     def _validar_cliente_en_cartera(self, vendedor_id: str | None, cliente_id) -> None:
         # Un pedido solo se crea para un cliente de la cartera del vendedor (mismo filtro que GET /clientes/{id}).
@@ -272,7 +427,11 @@ class SalesforceAdapter(CRMAdapter):
             "id":         r["Id"],
             "numero":     r.get("OrderNumber"),
             "estado":     r.get("Status"),
-            "total":      r.get("TotalAmount"),
+            # Total__c = total real (con descuento e IVA); TotalAmount de Salesforce es solo Σ precio × cantidad.
+            "total":      r.get("Total__c") if r.get("Total__c") is not None else r.get("TotalAmount"),
+            "subtotal":   r.get("Subtotal__c"),
+            "descuento":  r.get("Descuento__c"),
+            "iva":        r.get("IVA__c"),
             "cliente_id": r.get("AccountId"),
             "fecha":          r.get("EffectiveDate"),
             "fecha_creacion": r.get("CreatedDate"),
@@ -282,7 +441,13 @@ class SalesforceAdapter(CRMAdapter):
                     "producto_nombre": (i.get("Product2") or {}).get("Name"),
                     "cantidad":        i.get("Quantity"),
                     "precio_unitario": i.get("UnitPrice"),
-                    "total":           i.get("TotalPrice"),
+                    "total":           i.get("Total__c") if i.get("Total__c") is not None else i.get("TotalPrice"),
+                    "descuento":       i.get("Descuento__c"),
+                    "iva_porcentaje":  i.get("IVA_porcentaje__c"),
+                    "iva":             i.get("IVA__c"),
+                    "bonificacion":    bool(i.get("Bonificacion__c")),
+                    "promo_id":        i.get("Promocion__c"),
+                    "valor_lista":     i.get("Valor_lista__c"),
                 }
                 for i in items
             ],
