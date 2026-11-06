@@ -614,7 +614,7 @@ class SalesforceAdapter(CRMAdapter):
             "producto_id": a.get("Product__c"),
             "cantidad":    a.get("Cantidad__c"),
             # Unidad en que se bonifica: de TipoMedida__c (Unidades | Cajas). Por defecto unidades.
-            "unidad":      None if es_desc else ("cajas" if self._norm(a.get("TipoMedida__c")) in ("cajas", "caja") else "unidades"),
+            "unidad":      ("cajas" if self._norm(a.get("TipoMedida__c")) in ("cajas", "caja") else "unidades") if tipo == "bonificacion" else None,
             "tipo_medida": a.get("TipoMedida__c"),    # legado
             "descuento_tipo":  dtipo if es_desc else None,
             "descuento_valor": a.get("Valor_descuento__c") if es_desc else None,
@@ -622,6 +622,8 @@ class SalesforceAdapter(CRMAdapter):
 
     def _condicion(self, c: dict) -> dict:
         op = self._norm(c.get("Operador__c"))
+        if op and op.endswith("_que"):   # "Mayor o igual que" -> mayor_o_igual
+            op = op[:-4]
         med = self._norm(c.get("TipoMedida__c"))
         med = {"unidades": "unidades", "unidad": "unidades", "cajas": "cajas", "caja": "cajas",
                "monto": "monto", "montos": "monto"}.get(med, med)
