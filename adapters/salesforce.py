@@ -477,10 +477,18 @@ class SalesforceAdapter(CRMAdapter):
         "Presentacion__c, Capacidad__c, IVA__c, Unidades_por_caja__c"
     )
 
+    def _query_producto(self, where: str, todo: bool = False):
+        """Product2 con el nombre de la marca (Marca__r.Name); si la relación no existe en la org, repite sin ella."""
+        run = self.sf.query_all if todo else self.sf.query
+        try:
+            return run(f"SELECT {self._PRODUCTO_FIELDS}, Marca__r.Name FROM Product2 {where}")
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 400:
+                return run(f"SELECT {self._PRODUCTO_FIELDS} FROM Product2 {where}")
+            raise
+
     def get_productos(self) -> list[dict]:
-        records = self.sf.query_all(
-            f"SELECT {self._PRODUCTO_FIELDS} FROM Product2 WHERE IsActive = true"
-        )
+        records = self._query_producto("WHERE IsActive = true", todo=True)
         productos = [self._producto(r) for r in records]
 
         # Precios por lista: una entrada de `precios` por cada PricebookEntry activa (incluida la estándar).
@@ -508,9 +516,7 @@ class SalesforceAdapter(CRMAdapter):
         return productos
 
     def get_producto(self, record_id: str) -> dict:
-        data = self.sf.query(
-            f"SELECT {self._PRODUCTO_FIELDS} FROM Product2 WHERE Id = '{_safe_id(record_id)}' LIMIT 1"
-        )
+        data = self._query_producto(f"WHERE Id = '{_safe_id(record_id)}' LIMIT 1")
         records = data.get("records", [])
         if not records:
             raise ValueError(f"Producto {record_id} no encontrado")
@@ -522,7 +528,8 @@ class SalesforceAdapter(CRMAdapter):
             "nombre":           r.get("Name"),
             "codigo":           r.get("ProductCode"),
             "descripcion":      r.get("Description"),
-            "marca":            r.get("Marca__c"),
+            # Nombre de la marca (objeto Marca); None si el producto no tiene marca o la relación no está disponible.
+            "marca":            (r.get("Marca__r") or {}).get("Name"),
             "categoria":        r.get("Categoria__c"),
             "presentacion":     r.get("Presentacion__c"),
             "capacidad":        r.get("Capacidad__c"),
