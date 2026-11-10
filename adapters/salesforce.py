@@ -568,17 +568,29 @@ class SalesforceAdapter(CRMAdapter):
     def get_promos(self) -> list[dict]:
         # Solo activas y vigentes hoy (fecha en la zona horaria del tenant).
         hoy = datetime.now(self.zona).date().isoformat()
-        data = self.sf.query(
-            "SELECT Id, Name, Descripcion__c, Estado__c, Criterio__c, "
-            "FechaInicio__c, FechaFin__c, "
-            "(SELECT Id, Name, Product__c, Cantidad__c, TipoMedida__c, "
-            "Tipo__c, Tipo_descuento__c, Valor_descuento__c FROM PromosAcciones__r), "
-            "(SELECT Id, Name, Producto__c, Capacidad__c, Presentacion__c, "
-            "Operador__c, TipoMedida__c, Valor__c FROM PromosCondiciones__r) "
-            "FROM Promocion__c WHERE Estado__c = 'Activa' "
-            f"AND (FechaInicio__c = null OR FechaInicio__c <= {hoy}) "
-            f"AND (FechaFin__c = null OR FechaFin__c >= {hoy})"
-        )
+        def consulta(extra_cond: str) -> str:
+            return (
+                "SELECT Id, Name, Descripcion__c, Estado__c, Criterio__c, "
+                "FechaInicio__c, FechaFin__c, "
+                "(SELECT Id, Name, Product__c, Cantidad__c, TipoMedida__c, "
+                "Tipo__c, Tipo_descuento__c, Valor_descuento__c FROM PromosAcciones__r), "
+                "(SELECT Id, Name, Producto__c, Capacidad__c, Presentacion__c, "
+                f"Operador__c, TipoMedida__c, Valor__c{extra_cond} FROM PromosCondiciones__r) "
+                "FROM Promocion__c WHERE Estado__c = 'Activa' "
+                f"AND (FechaInicio__c = null OR FechaInicio__c <= {hoy}) "
+                f"AND (FechaFin__c = null OR FechaFin__c >= {hoy})"
+            )
+
+        # Marca y categoría de la condición (nombres). Si algún campo aún no existe en la org (400), se
+        # reintenta con menos campos: marca y/o categoría salen null en vez de romper GET /promos.
+        data = None
+        for extra in (", Marca__r.Name, Categoria__c", ", Marca__r.Name", ", Categoria__c", ""):
+            try:
+                data = self.sf.query(consulta(extra))
+                break
+            except HTTPError as e:
+                if extra == "" or e.response is None or e.response.status_code != 400:
+                    raise
         promos = data.get("records", [])
 
         # Listas de precios por promo (junction). Sin filas = aplica a todas las listas.
@@ -657,8 +669,8 @@ class SalesforceAdapter(CRMAdapter):
             "id":          c["Id"],
             "nombre":      c.get("Name"),
             "producto_id": c.get("Producto__c"),
-            "marca":       None,
-            "categoria":   None,
+            "marca":       (c.get("Marca__r") or {}).get("Name"),   # nombre de la marca; None si no filtra por marca
+            "categoria":   c.get("Categoria__c") or None,           # valor del picklist; None si no filtra
             "presentacion": c.get("Presentacion__c"),
             "capacidad":   c.get("Capacidad__c"),
             "medida":      med,
