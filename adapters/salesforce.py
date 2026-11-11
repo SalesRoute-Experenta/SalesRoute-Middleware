@@ -5,7 +5,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from requests.exceptions import HTTPError
 
-from adapters.base import CRMAdapter
+from adapters.base import ConflictError, CRMAdapter
 from sf_client import SalesforceClient
 
 _SF_ID_RE = re.compile(r'^[a-zA-Z0-9]{15,18}$')
@@ -463,6 +463,46 @@ class SalesforceAdapter(CRMAdapter):
         payload = {k: v for k, v in data.items() if v is not None}
         self.sf.update("Order", _safe_id(record_id), payload)
         return {"id": record_id, "updated": True}
+
+    def anular_pedido(self, vendedor_id: str | None, record_id: str, data: dict) -> dict:
+        """Anula un pedido sincronizado sin clon: Status = «Anulado» (+ Motivo_Anulacion__c si existe).
+        Idempotente por estado: un segundo intento responde 409."""
+        data = data or {}
+        motivo = data.get("motivo")
+        if motivo is not None and (not isinstance(motivo, str) or len(motivo) > 255):
+            raise ValueError("Dato inválido: motivo debe ser texto de máximo 255 caracteres")
+        motivo = motivo.strip() or None if isinstance(motivo, str) else None
+        oid = _safe_id(record_id)
+        recs = self.sf.query(
+            f"SELECT Id, OrderNumber, Status, StatusCode FROM Order "
+            f"WHERE Id = '{oid}' AND {self._pedidos_cartera(vendedor_id)} LIMIT 1"
+        ).get("records", [])
+        if not recs:
+            raise ValueError(f"Pedido {record_id} no encontrado")
+        o = recs[0]
+        if o.get("Status") == "Anulado":
+            raise ConflictError("El pedido ya está anulado")
+        if o.get("StatusCode") != "Activated":
+            raise ValueError("Dato inválido: solo se anula un pedido sincronizado (Activated)")
+        payloads = [{"Status": "Anulado", "Motivo_Anulacion__c": motivo}] if motivo else []
+        payloads.append({"Status": "Anulado"})
+        for i, payload in enumerate(payloads):
+            try:
+                self.sf.update("Order", oid, payload)
+                break
+            except HTTPError as e:
+                st = e.response.status_code if e.response is not None else 0
+                # 400 con motivo: puede faltar Motivo_Anulacion__c; se repite solo con el Status.
+                if st == 400 and i < len(payloads) - 1:
+                    continue
+                raise RuntimeError("No se pudo anular el pedido. Reintenta.") from e
+        return {
+            "id": oid,
+            "numero": o.get("OrderNumber"),
+            "estado": "Anulado",
+            "original_anulado": True,
+            "motivo": motivo,
+        }
 
     def _pedido(self, r: dict) -> dict:
         items = (r.get("OrderItems") or {}).get("records", [])
