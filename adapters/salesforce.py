@@ -258,17 +258,69 @@ class SalesforceAdapter(CRMAdapter):
     def _r2(d: Decimal) -> Decimal:
         return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
+    _ID_LOCAL_RE = re.compile(r"^[A-Za-z0-9-]{1,36}$")
+
+    def _pedido_existente(self, vendedor_id: str | None, id_local: str) -> dict | None:
+        """Pedido de la cartera del vendedor ya creado con ese id_local (UUID__c), para reintentos sin duplicar."""
+        soql = (f"SELECT Id, OrderNumber, Status, Total__c, TotalAmount, OriginalOrderId FROM Order "
+                f"WHERE UUID__c = '{id_local}' AND {self._pedidos_cartera(vendedor_id)} LIMIT 1")
+        try:
+            recs = self.sf.query(soql).get("records", [])
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 400:
+                return None   # la org aún no tiene UUID__c
+            raise
+        return recs[0] if recs else None
+
+    def _validar_original(self, vendedor_id: str | None, original_id, cliente_id, tipo) -> dict:
+        """Reglas 1 a 6 del clon: el original existe, es de la cartera, está sincronizado y no anulado, y coincide en cliente y tipo."""
+        if not isinstance(original_id, str) or not _SF_ID_RE.match(original_id):
+            raise ValueError(f"ID inválido: {original_id!r}")
+        recs = self.sf.query(
+            f"SELECT Id, Status, StatusCode, AccountId, Type FROM Order "
+            f"WHERE Id = '{original_id}' AND {self._pedidos_cartera(vendedor_id)} LIMIT 1"
+        ).get("records", [])
+        if not recs:
+            raise ValueError(f"Pedido {original_id} no encontrado")
+        o = recs[0]
+        if o.get("Status") == "Anulado":
+            raise ConflictError("El pedido original ya está anulado")
+        if o.get("StatusCode") != "Activated":
+            raise ValueError("Dato inválido: el pedido original no está sincronizado (Activated)")
+        if o.get("AccountId") != cliente_id:
+            raise ValueError("Dato inválido: cliente_id debe ser el del pedido original")
+        if (o.get("Type") or "Nuevo").lower() != (tipo or "nuevo"):
+            raise ValueError("Dato inválido: tipo debe ser el del pedido original")
+        return o
+
     def _crear_pedido_validado(self, vendedor_id: str | None, data: dict) -> dict:
         cliente_id = data["cliente_id"]
+        id_local = data.get("id_local")
+        if id_local is not None and (not isinstance(id_local, str) or not self._ID_LOCAL_RE.match(id_local)):
+            raise ValueError("Dato inválido: id_local debe ser texto de 1 a 36 caracteres (letras, números y guiones)")
+        original_id = data.get("pedido_original_id")
+        if id_local:
+            previo = self._pedido_existente(vendedor_id, id_local)
+            if previo:
+                # Reintento: devuelve el pedido ya creado, sin crear otro ni anular de nuevo.
+                total = previo.get("Total__c") if previo.get("Total__c") is not None else previo.get("TotalAmount")
+                resp = {"id": previo["Id"], "numero": previo.get("OrderNumber"), "estado": previo.get("Status"),
+                        "id_local": id_local, "total": total}
+                if previo.get("OriginalOrderId"):
+                    resp.update({"pedido_original_id": previo["OriginalOrderId"], "original_anulado": True})
+                return resp
+        tipo_pedido = data.get("tipo")
+        if tipo_pedido is not None and tipo_pedido not in self._TIPOS_PEDIDO:
+            raise ValueError("Dato inválido: tipo debe ser nuevo, cambio o devolucion")
+        if original_id is not None:
+            self._validar_original(vendedor_id, original_id, cliente_id, tipo_pedido)
         cliente = self._cliente_de_cartera(vendedor_id, cliente_id)
         lista = cliente.get("Price_Book__c")
         if not lista:
             raise ValueError("Dato inválido: el cliente no tiene lista de precios")
         if data.get("lista_precios_id") != lista:
             raise ValueError("Dato inválido: lista_precios_id no es la lista de precios del cliente")
-        tipo = data.get("tipo")
-        if tipo is not None and tipo not in self._TIPOS_PEDIDO:
-            raise ValueError("Dato inválido: tipo debe ser nuevo, cambio o devolucion")
+        tipo = tipo_pedido
         fecha = data.get("fecha") or date.today().isoformat()
         if not isinstance(fecha, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", fecha):
             raise ValueError("Dato inválido: fecha debe ser YYYY-MM-DD")
@@ -371,6 +423,9 @@ class SalesforceAdapter(CRMAdapter):
         # Sin transacción multi-objeto en este flujo: si falla una línea se borra el pedido (todo o nada).
         order_id = self._crear("Order", {
             "AccountId": cliente_id, "Status": "Draft", "EffectiveDate": fecha, "Pricebook2Id": lista,
+            "Type": (tipo or "nuevo").capitalize(),
+            **({"UUID__c": id_local} if id_local else {}),
+            **({"OriginalOrderId": original_id} if original_id else {}),
             **({"CurrencyIsoCode": moneda} if moneda else {}),
             "Subtotal__c": float(t_sub), "Descuento__c": float(t_desc), "IVA__c": float(t_iva), "Total__c": float(t_total),
         })["id"]
@@ -390,6 +445,17 @@ class SalesforceAdapter(CRMAdapter):
                     item["BonificacionId__c"] = f["bid"]
                 self._crear("OrderItem", item)
             self.sf.update("Order", order_id, {"Status": "Activated"})
+            if original_id:
+                # Primero el clon y luego la anulación: nunca queda un original anulado sin su reemplazo.
+                try:
+                    self.sf.update("Order", original_id, {"Status": "Anulado"})
+                except Exception as e:
+                    # Un pedido Activated no se borra: se regresa el clon a Draft para poder eliminarlo.
+                    try:
+                        self.sf.update("Order", order_id, {"Status": "Draft"})
+                    except Exception:
+                        pass
+                    raise RuntimeError("No se pudo anular el pedido original; el clon no se guardó. Reintenta.") from e
         except Exception:
             try:
                 self.sf.delete("Order", order_id)
@@ -397,8 +463,11 @@ class SalesforceAdapter(CRMAdapter):
                 pass
             raise
         recs = self.sf.query(f"SELECT OrderNumber FROM Order WHERE Id = '{order_id}'").get("records") or [{}]
-        return {"id": order_id, "numero": recs[0].get("OrderNumber"), "estado": "Activated",
-                "id_local": data.get("id_local"), "total": float(t_total)}
+        resp = {"id": order_id, "numero": recs[0].get("OrderNumber"), "estado": "Activated",
+                "id_local": id_local, "total": float(t_total)}
+        if original_id:
+            resp.update({"pedido_original_id": original_id, "original_anulado": True})
+        return resp
 
     def _query_moneda(self, soql, todo: bool = False):
         """Consulta con CurrencyIsoCode; si la org no es multimoneda (campo inexistente) repite sin él."""
