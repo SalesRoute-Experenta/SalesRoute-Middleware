@@ -1,6 +1,10 @@
 from abc import ABC, abstractmethod
 
 
+class ConflictError(Exception):
+    """Estado del recurso incompatible con la operación (HTTP 409)."""
+
+
 class CRMAdapter(ABC):
 
     @abstractmethod
@@ -20,6 +24,9 @@ class CRMAdapter(ABC):
 
     @abstractmethod
     def actualizar_pedido(self, record_id: str, data: dict) -> dict: ...
+
+    def anular_pedido(self, vendedor_id: str | None, record_id: str, data: dict) -> dict:
+        raise NotImplementedError("Anular pedido: no disponible en este CRM")
 
     @abstractmethod
     def get_productos(self, vendedor_id: str | None = None) -> list[dict]: ...

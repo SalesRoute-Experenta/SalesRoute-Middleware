@@ -3,6 +3,7 @@ import os
 
 import requests as http_requests
 
+from adapters.base import ConflictError
 from adapters.salesforce import SalesforceAdapter
 from adapters.experenta_crm import ExperentaCRMAdapter
 from secrets_manager import get_credentials
@@ -78,6 +79,11 @@ def handler(event, context):
             return _ok(adapter.get_pedido(vendedor_id, record_id))
         if path == "/pedidos" and method == "POST":
             return _ok(adapter.crear_pedido(vendedor_id, body))
+        if path.startswith("/pedidos/") and path.endswith("/anular") and method == "POST":
+            partes = path.split("/")
+            if len(partes) != 4:
+                return _error(404, "Ruta no encontrada")
+            return _ok(adapter.anular_pedido(vendedor_id, partes[2], body))
         if path.startswith("/pedidos/") and method == "PUT":
             record_id = path.split("/")[-1]
             return _ok(adapter.actualizar_pedido(record_id, body))
@@ -129,6 +135,8 @@ def handler(event, context):
         if status == 401:
             return _error(401, "Token de CRM expirado o inválido.")
         return _error(502, f"Error del CRM: {status}")
+    except ConflictError as e:
+        return _error(409, str(e))
     except NotImplementedError as e:
         return _error(501, str(e))
     except PermissionError as e:

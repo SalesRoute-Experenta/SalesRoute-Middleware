@@ -1,7 +1,7 @@
 {
   "info": {
-    "name": "NUGO Middleware - Productos, promos y pedidos (v1)",
-    "description": "Valida los contratos GET /clientes (lista de precios), GET /productos, GET /promos y POST /pedidos con totales. Ejecutar en orden. El paso 4 CREA un pedido real: usar un cliente de prueba y con aprobación. Llenar cognitoUser y cognitoPassword (no commitear).",
+    "name": "NUGO Middleware - Productos, promos y pedidos (v2)",
+    "description": "Valida los contratos GET /clientes, GET /productos, GET /promos, POST /pedidos con totales, y el flujo de edición: clon con pedido_original_id, idempotencia por id_local, anulación sin clon y reemplazado_por_id. Ejecutar en orden. Los pasos 4, 10, 11 y 15 ESCRIBEN pedidos reales en Salesforce: usar un cliente de prueba y con aprobación (el 10 crea un original, el 11 lo reemplaza por un clon con promoción, el 15 anula el clon). promoId y promoDescuento son variables: la promo debe estar vigente hoy. Llenar cognitoUser y cognitoPassword (no commitear).",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "event": [
@@ -82,6 +82,42 @@
     {
       "key": "cognitoPassword",
       "value": ""
+    },
+    {
+      "key": "originalId",
+      "value": ""
+    },
+    {
+      "key": "originalBody",
+      "value": ""
+    },
+    {
+      "key": "originalTotal",
+      "value": ""
+    },
+    {
+      "key": "cloneId",
+      "value": ""
+    },
+    {
+      "key": "cloneBody",
+      "value": ""
+    },
+    {
+      "key": "cloneTotal",
+      "value": ""
+    },
+    {
+      "key": "cloneBody409",
+      "value": ""
+    },
+    {
+      "key": "promoId",
+      "value": "a29Uh0000030AP3IAM"
+    },
+    {
+      "key": "promoDescuento",
+      "value": "1000.00"
     }
   ],
   "item": [
@@ -468,6 +504,302 @@
               "const o = pm.response.json();",
               "pm.test('totales del pedido', () => { ['subtotal','descuento','iva','total','lineas'].forEach(k => pm.expect(o).to.have.property(k)); pm.expect(o.total).to.eql(Number(pm.collectionVariables.get('pedidoTotal'))); });",
               "pm.test('campos por línea', () => ['descuento','iva_porcentaje','iva','bonificacion','promo_id','valor_lista'].forEach(k => pm.expect(o.lineas[0]).to.have.property(k)));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "10. POST /pedidos (crea el ORIGINAL del flujo de clon)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/pedidos",
+        "description": "ATENCIÓN: escribe en Salesforce (pedido real). Usar solo con un cliente de prueba y con aprobación. Crea un pedido Activated normal de 2 unidades, sin promoción. Es el pedido que el paso 11 reemplaza con un clon.",
+        "body": {
+          "mode": "raw",
+          "raw": "{{originalBody}}"
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Montos en centavos para no tener errores de coma flotante; redondeo half-up.",
+              "const m = x => Math.round(x) / 100;",
+              "const precioC = Math.round(Number(pm.collectionVariables.get('productoPrecio')) * 100);",
+              "const pct = Number(pm.collectionVariables.get('productoIva'));",
+              "function armar(cant, descC, promoId, originalId, idLocal) {",
+              "  const sub = precioC * cant, neto = sub - descC;",
+              "  const iva = Math.floor(neto * pct / 100 + 0.5 + 1e-9);",
+              "  const linea = { producto_id: pm.collectionVariables.get('productoId'), cantidad: cant, precio_unitario: precioC / 100, subtotal: m(sub), descuento: m(descC), iva_porcentaje: pct, iva: m(iva), total: m(neto + iva), bonificacion: false, promo_id: promoId, bonificacion_id: null, valor_lista: null };",
+              "  const pedido = { id_local: idLocal, cliente_id: pm.collectionVariables.get('clienteId'), lista_precios_id: pm.collectionVariables.get('listaPreciosId'), tipo: 'nuevo', fecha: pm.collectionVariables.get('fecha'), lineas: [linea], subtotal: m(sub), descuento: m(descC), iva: m(iva), total: m(neto + iva) };",
+              "  if (originalId) pedido.pedido_original_id = originalId;",
+              "  return pedido;",
+              "}",
+              "const pedido = armar(2, 0, null, null, pm.variables.replaceIn('{{$guid}}'));",
+              "pm.collectionVariables.set('originalBody', JSON.stringify(pedido));",
+              "pm.collectionVariables.set('originalTotal', pedido.total);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));",
+              "const r = pm.response.json();",
+              "pm.test('Activated con total correcto', () => { pm.expect(r.estado).to.eql('Activated'); pm.expect(r.total).to.eql(Number(pm.collectionVariables.get('originalTotal'))); });",
+              "pm.collectionVariables.set('originalId', r.id);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "11. POST /pedidos CLON del original, con una promoción aplicada",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/pedidos",
+        "description": "ATENCIÓN: escribe en Salesforce (pedido real). Usar solo con un cliente de prueba y con aprobación. Edición por clon: mismo cliente y tipo, `pedido_original_id` = el original del paso 10, 3 unidades y un descuento de promoción (`promo_id` = variable promoId, descuento fijo promoDescuento). El Middleware crea el clon con `Pedido_Original_Id__c` y anula el original (solo cambia su Status). La promo debe estar vigente hoy.",
+        "body": {
+          "mode": "raw",
+          "raw": "{{cloneBody}}"
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Montos en centavos para no tener errores de coma flotante; redondeo half-up.",
+              "const m = x => Math.round(x) / 100;",
+              "const precioC = Math.round(Number(pm.collectionVariables.get('productoPrecio')) * 100);",
+              "const pct = Number(pm.collectionVariables.get('productoIva'));",
+              "function armar(cant, descC, promoId, originalId, idLocal) {",
+              "  const sub = precioC * cant, neto = sub - descC;",
+              "  const iva = Math.floor(neto * pct / 100 + 0.5 + 1e-9);",
+              "  const linea = { producto_id: pm.collectionVariables.get('productoId'), cantidad: cant, precio_unitario: precioC / 100, subtotal: m(sub), descuento: m(descC), iva_porcentaje: pct, iva: m(iva), total: m(neto + iva), bonificacion: false, promo_id: promoId, bonificacion_id: null, valor_lista: null };",
+              "  const pedido = { id_local: idLocal, cliente_id: pm.collectionVariables.get('clienteId'), lista_precios_id: pm.collectionVariables.get('listaPreciosId'), tipo: 'nuevo', fecha: pm.collectionVariables.get('fecha'), lineas: [linea], subtotal: m(sub), descuento: m(descC), iva: m(iva), total: m(neto + iva) };",
+              "  if (originalId) pedido.pedido_original_id = originalId;",
+              "  return pedido;",
+              "}",
+              "const idLocal = pm.variables.replaceIn('{{$guid}}');",
+              "const pedido = armar(3, Math.round(Number(pm.collectionVariables.get('promoDescuento')) * 100), pm.collectionVariables.get('promoId'), pm.collectionVariables.get('originalId'), idLocal);",
+              "pm.collectionVariables.set('cloneBody', JSON.stringify(pedido));",
+              "pm.collectionVariables.set('cloneTotal', pedido.total);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));",
+              "const r = pm.response.json();",
+              "pm.test('clon creado y activado', () => { ['id','numero','estado','id_local','total'].forEach(k => pm.expect(r).to.have.property(k)); pm.expect(r.estado).to.eql('Activated'); pm.expect(r.total).to.eql(Number(pm.collectionVariables.get('cloneTotal'))); });",
+              "pm.test('apunta al original y lo anuló', () => { pm.expect(r.pedido_original_id).to.eql(pm.collectionVariables.get('originalId')); pm.expect(r.original_anulado).to.eql(true); });",
+              "pm.collectionVariables.set('cloneId', r.id);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "12. POST /pedidos mismo clon, mismo id_local (reintento)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/pedidos",
+        "description": "Reintento del paso 11 con el MISMO body e id_local: el Middleware devuelve el pedido ya creado (200) sin crear otro ni anular de nuevo.",
+        "body": {
+          "mode": "raw",
+          "raw": "{{cloneBody}}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));",
+              "const r = pm.response.json();",
+              "pm.test('mismo pedido, sin duplicar', () => { pm.expect(r.id).to.eql(pm.collectionVariables.get('cloneId')); pm.expect(r.pedido_original_id).to.eql(pm.collectionVariables.get('originalId')); pm.expect(r.original_anulado).to.eql(true); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "13. GET /pedidos/{id} del original (Anulado y reemplazado)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/pedidos/{{originalId}}",
+        "description": "El original quedó «Anulado» y `reemplazado_por_id` apunta al clon."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));",
+              "const o = pm.response.json();",
+              "pm.test('Anulado y reemplazado por el clon', () => { pm.expect(o.estado).to.eql('Anulado'); pm.expect(o.reemplazado_por_id).to.eql(pm.collectionVariables.get('cloneId')); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "14. POST /pedidos clon de un original ya anulado (409)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/pedidos",
+        "description": "Otro clon del mismo original, ya anulado, con otro id_local: 409 sin crear nada.",
+        "body": {
+          "mode": "raw",
+          "raw": "{{cloneBody409}}"
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const b = JSON.parse(pm.collectionVariables.get('cloneBody'));",
+              "b.id_local = pm.variables.replaceIn('{{$guid}}');",
+              "pm.collectionVariables.set('cloneBody409', JSON.stringify(b));"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('409', () => pm.response.to.have.status(409));",
+              "pm.test('mensaje', () => pm.expect(pm.response.json().error).to.include('ya está anulado'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "15. POST /pedidos/{id}/anular (anulación sin clon, con motivo)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/pedidos/{{cloneId}}/anular",
+        "description": "ATENCIÓN: escribe en Salesforce (pedido real). Usar solo con un cliente de prueba y con aprobación. Anula el clon del paso 11 sin crear reemplazo. `motivo` es opcional (máx. 255).",
+        "body": {
+          "mode": "raw",
+          "raw": "{ \"motivo\": \"Prueba de anulación sin clon (Postman)\" }"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));",
+              "const r = pm.response.json();",
+              "pm.test('anulado con motivo', () => { pm.expect(r.id).to.eql(pm.collectionVariables.get('cloneId')); pm.expect(r.estado).to.eql('Anulado'); pm.expect(r.original_anulado).to.eql(true); pm.expect(r.motivo).to.eql('Prueba de anulación sin clon (Postman)'); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "16. POST /pedidos/{id}/anular otra vez (409, idempotente por estado)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/pedidos/{{cloneId}}/anular",
+        "description": "Un segundo intento sobre un pedido ya anulado responde 409; la app lo toma como éxito.",
+        "body": {
+          "mode": "raw",
+          "raw": "{}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('409', () => pm.response.to.have.status(409));",
+              "pm.test('mensaje', () => pm.expect(pm.response.json().error).to.include('ya está anulado'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "17. POST /pedidos/{id}/anular de un pedido inexistente (404)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/pedidos/801000000000000AAA/anular",
+        "description": "Pedido inexistente o fuera de la cartera: 404, sin revelar cuál es el caso.",
+        "body": {
+          "mode": "raw",
+          "raw": "{}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('404', () => pm.response.to.have.status(404));"
             ]
           }
         }
