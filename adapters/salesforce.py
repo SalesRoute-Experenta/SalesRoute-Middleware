@@ -263,8 +263,8 @@ class SalesforceAdapter(CRMAdapter):
     def _pedido_existente(self, vendedor_id: str | None, id_local: str) -> dict | None:
         """Pedido de la cartera del vendedor ya creado con ese id_local (UUID__c), para reintentos sin duplicar."""
         cartera = self._pedidos_cartera(vendedor_id)
-        # Sin Pedido_Original__c si el campo aún no existe; sin UUID__c no hay idempotencia posible.
-        for campos in ("Id, OrderNumber, Status, Total__c, TotalAmount, Pedido_Original__c",
+        # Sin Pedido_Original_Id__c si el campo aún no existe; sin UUID__c no hay idempotencia posible.
+        for campos in ("Id, OrderNumber, Status, Total__c, TotalAmount, Pedido_Original_Id__c",
                        "Id, OrderNumber, Status, Total__c, TotalAmount"):
             try:
                 recs = self.sf.query(
@@ -309,8 +309,8 @@ class SalesforceAdapter(CRMAdapter):
                 total = previo.get("Total__c") if previo.get("Total__c") is not None else previo.get("TotalAmount")
                 resp = {"id": previo["Id"], "numero": previo.get("OrderNumber"), "estado": previo.get("Status"),
                         "id_local": id_local, "total": total}
-                if previo.get("Pedido_Original__c"):
-                    resp.update({"pedido_original_id": previo["Pedido_Original__c"], "original_anulado": True})
+                if previo.get("Pedido_Original_Id__c"):
+                    resp.update({"pedido_original_id": previo["Pedido_Original_Id__c"], "original_anulado": True})
                 return resp
         tipo_pedido = data.get("tipo")
         if tipo_pedido is not None and tipo_pedido not in self._TIPOS_PEDIDO:
@@ -428,7 +428,7 @@ class SalesforceAdapter(CRMAdapter):
             "AccountId": cliente_id, "Status": "Draft", "EffectiveDate": fecha, "Pricebook2Id": lista,
             "Type": (tipo or "nuevo").capitalize(),
             **({"UUID__c": id_local} if id_local else {}),
-            **({"Pedido_Original__c": original_id} if original_id else {}),
+            **({"Pedido_Original_Id__c": original_id} if original_id else {}),
             **({"CurrencyIsoCode": moneda} if moneda else {}),
             "Subtotal__c": float(t_sub), "Descuento__c": float(t_desc), "IVA__c": float(t_iva), "Total__c": float(t_total),
         })["id"]
