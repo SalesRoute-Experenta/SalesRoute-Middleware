@@ -84,7 +84,7 @@ def handler(event, context):
 
         # Productos
         if path == "/productos" and method == "GET":
-            return _ok(adapter.get_productos())
+            return _ok(adapter.get_productos(vendedor_id))
         if path.startswith("/productos/") and method == "GET":
             record_id = path.split("/")[-1]
             return _ok(adapter.get_producto(record_id))
