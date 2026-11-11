@@ -179,7 +179,26 @@ class SalesforceAdapter(CRMAdapter):
         if cliente_id:
             filtro += f" AND AccountId = '{_safe_id(cliente_id)}'"
         records = self._query_pedidos(f"WHERE {filtro} ORDER BY CreatedDate DESC", todo=True)
-        return [self._pedido(r) for r in records]
+        reemplazos = self._reemplazos(records)
+        return [self._pedido(r, reemplazos.get(r["Id"])) for r in records]
+
+    def _reemplazos(self, records: list[dict]) -> dict[str, str]:
+        """{id del pedido anulado: id del clon que lo reemplazó}. Se calcula con Pedido_Original_Id__c del clon;
+        no se guarda nada en el original. Sin el campo en la org (400), nadie aparece como reemplazado."""
+        anulados = [r["Id"] for r in records if r.get("Status") == "Anulado"]
+        mapa: dict[str, str] = {}
+        for i in range(0, len(anulados), 100):
+            in_ids = ", ".join(f"'{_safe_id(x)}'" for x in anulados[i:i + 100])
+            try:
+                for c in self.sf.query_all(
+                        f"SELECT Id, Pedido_Original_Id__c FROM Order WHERE Pedido_Original_Id__c IN ({in_ids})"):
+                    if c.get("Pedido_Original_Id__c"):
+                        mapa[c["Pedido_Original_Id__c"]] = c["Id"]
+            except HTTPError as e:
+                if e.response is not None and e.response.status_code == 400:
+                    return {}
+                raise
+        return mapa
 
     def get_pedido(self, vendedor_id: str | None, record_id: str) -> dict:
         data = self._query_pedidos(
@@ -188,7 +207,7 @@ class SalesforceAdapter(CRMAdapter):
         records = data.get("records", [])
         if not records:
             raise ValueError(f"Pedido {record_id} no encontrado")
-        return self._pedido(records[0])
+        return self._pedido(records[0], self._reemplazos(records).get(records[0]["Id"]))
 
     def crear_pedido(self, vendedor_id: str | None, data: dict) -> dict:
         from datetime import date
@@ -576,12 +595,13 @@ class SalesforceAdapter(CRMAdapter):
             "motivo": motivo,
         }
 
-    def _pedido(self, r: dict) -> dict:
+    def _pedido(self, r: dict, reemplazado_por_id: str | None = None) -> dict:
         items = (r.get("OrderItems") or {}).get("records", [])
         return {
             "id":         r["Id"],
             "numero":     r.get("OrderNumber"),
             "estado":     r.get("Status"),
+            "reemplazado_por_id": reemplazado_por_id,
             # Total__c = total real (con descuento e IVA); TotalAmount de Salesforce es solo Σ precio × cantidad.
             "total":      r.get("Total__c") if r.get("Total__c") is not None else r.get("TotalAmount"),
             "subtotal":   r.get("Subtotal__c"),
