@@ -9,6 +9,7 @@ from adapters.base import CRMAdapter
 from sf_client import SalesforceClient
 
 _SF_ID_RE = re.compile(r'^[a-zA-Z0-9]{15,18}$')
+_UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
 _OFFSET_RE = re.compile(r'^([+-])(\d{2}):(\d{2})$')
 
 # Honduras no usa horario de verano; un tenant en otra zona lo define con "utc_offset" en su secreto.
@@ -149,12 +150,25 @@ class SalesforceAdapter(CRMAdapter):
 
     # ── Pedidos ───────────────────────────────────────────────────────────────
 
-    _PEDIDO_FIELDS = (
-        "Id, OrderNumber, Status, TotalAmount, AccountId, EffectiveDate, CreatedDate, "
-        "Subtotal__c, Descuento__c, IVA__c, Total__c, "
-        "(SELECT Product2Id, Product2.Name, Quantity, UnitPrice, TotalPrice, Descuento__c, "
-        "IVA_porcentaje__c, IVA__c, Total__c, Bonificacion__c, Promocion__c, Valor_lista__c FROM OrderItems)"
-    )
+    @staticmethod
+    def _pedido_fields(con_bonif_id: bool = True) -> str:
+        extra = ", Bonificacion_Id__c" if con_bonif_id else ""
+        return (
+            "Id, OrderNumber, Status, TotalAmount, AccountId, EffectiveDate, CreatedDate, "
+            "Subtotal__c, Descuento__c, IVA__c, Total__c, "
+            "(SELECT Product2Id, Product2.Name, Quantity, UnitPrice, TotalPrice, Descuento__c, "
+            f"IVA_porcentaje__c, IVA__c, Total__c, Bonificacion__c, Promocion__c, Valor_lista__c{extra} FROM OrderItems)"
+        )
+
+    def _query_pedidos(self, tail: str, todo: bool = False):
+        """Consulta de pedidos; si OrderItem.Bonificacion_Id__c aún no existe en la org (400), repite sin él."""
+        run = self.sf.query_all if todo else self.sf.query
+        try:
+            return run(f"SELECT {self._pedido_fields(True)} FROM Order {tail}")
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 400:
+                return run(f"SELECT {self._pedido_fields(False)} FROM Order {tail}")
+            raise
 
     # Los pedidos del vendedor son los de los clientes de su cartera (mismo filtro que /clientes).
     # Con ?cliente_id= de un cliente fuera de la cartera la lista sale vacía, sin revelar nada.
@@ -165,14 +179,11 @@ class SalesforceAdapter(CRMAdapter):
         filtro = self._pedidos_cartera(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulos
         if cliente_id:
             filtro += f" AND AccountId = '{_safe_id(cliente_id)}'"
-        records = self.sf.query_all(
-            f"SELECT {self._PEDIDO_FIELDS} FROM Order WHERE {filtro} ORDER BY CreatedDate DESC"
-        )
+        records = self._query_pedidos(f"WHERE {filtro} ORDER BY CreatedDate DESC", todo=True)
         return [self._pedido(r) for r in records]
 
     def get_pedido(self, vendedor_id: str | None, record_id: str) -> dict:
-        data = self.sf.query(
-            f"SELECT {self._PEDIDO_FIELDS} FROM Order "
+        data = self._query_pedidos(
             f"WHERE Id = '{_safe_id(record_id)}' AND {self._pedidos_cartera(vendedor_id)} LIMIT 1"
         )
         records = data.get("records", [])
@@ -326,6 +337,9 @@ class SalesforceAdapter(CRMAdapter):
                 raise ValueError(f"Dato inválido: {n}: descuento fuera de rango")
             iva = cero if bonif else self._r2((subtotal - desc) * pct / 100)
             total = subtotal - desc + iva
+            bid = l.get("bonificacion_id")
+            if bid is not None and (not isinstance(bid, str) or not _UUID_RE.match(bid)):
+                raise ValueError(f"Dato inválido: {n}: bonificacion_id debe ser un UUID")
             valor_lista = None
             if bonif:
                 valor_lista = self._r2(precio_lista * cant)
@@ -338,7 +352,9 @@ class SalesforceAdapter(CRMAdapter):
             t_desc += desc
             t_iva += iva
             filas.append({"pid": pid, "entry": entrada["Id"], "cant": cant, "precio": precio, "desc": desc, "pct": pct,
-                          "iva": iva, "total": total, "bonif": bonif, "promo": promo, "valor_lista": valor_lista})
+                          "iva": iva, "total": total, "bonif": bonif, "promo": promo, "valor_lista": valor_lista,
+                          "bid": bid.lower() if bid else None})
+        self._validar_grupos_bonificacion(filas)
         t_total = t_sub - t_desc + t_iva
         for campo, calc in (("subtotal", t_sub), ("descuento", t_desc), ("iva", t_iva), ("total", t_total)):
             if self._dec(data.get(campo), campo) != calc:
@@ -362,6 +378,8 @@ class SalesforceAdapter(CRMAdapter):
                     item["Promocion__c"] = f["promo"]
                 if f["valor_lista"] is not None:
                     item["Valor_lista__c"] = float(f["valor_lista"])
+                if f["bid"]:
+                    item["Bonificacion_Id__c"] = f["bid"]
                 self._crear("OrderItem", item)
             self.sf.update("Order", order_id, {"Status": "Activated"})
         except Exception:
@@ -373,6 +391,24 @@ class SalesforceAdapter(CRMAdapter):
         recs = self.sf.query(f"SELECT OrderNumber FROM Order WHERE Id = '{order_id}'").get("records") or [{}]
         return {"id": order_id, "numero": recs[0].get("OrderNumber"), "estado": "Activated",
                 "id_local": data.get("id_local"), "total": float(t_total)}
+
+    @staticmethod
+    def _validar_grupos_bonificacion(filas: list[dict]) -> None:
+        """bonificacion_id agrupa una aplicación de promo: las líneas que la disparan y las líneas bonificadas."""
+        grupos: dict[str, list[tuple[int, dict]]] = {}
+        for i, f in enumerate(filas, 1):
+            if f["bid"]:
+                grupos.setdefault(f["bid"], []).append((i, f))
+        for bid, miembros in grupos.items():
+            bonificadas = [(i, f) for i, f in miembros if f["bonif"]]
+            origen = [(i, f) for i, f in miembros if not f["bonif"]]
+            lineas = ", ".join(str(i) for i, _ in miembros)
+            if not bonificadas:
+                raise ValueError(f"Dato inválido: bonificacion_id {bid} (líneas {lineas}) no tiene ninguna línea bonificada")
+            if not origen:
+                raise ValueError(f"Dato inválido: bonificacion_id {bid} (líneas {lineas}) no tiene ninguna línea de compra que la origine")
+            if len({f["promo"] for _, f in bonificadas}) > 1:
+                raise ValueError(f"Dato inválido: bonificacion_id {bid} (líneas {lineas}): las líneas bonificadas deben tener el mismo promo_id")
 
     def _query_moneda(self, soql, todo: bool = False):
         """Consulta con CurrencyIsoCode; si la org no es multimoneda (campo inexistente) repite sin él."""
@@ -465,6 +501,7 @@ class SalesforceAdapter(CRMAdapter):
                     "bonificacion":    bool(i.get("Bonificacion__c")),
                     "promo_id":        i.get("Promocion__c"),
                     "valor_lista":     i.get("Valor_lista__c"),
+                    "bonificacion_id": i.get("Bonificacion_Id__c"),
                 }
                 for i in items
             ],
