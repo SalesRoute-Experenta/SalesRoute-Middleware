@@ -477,10 +477,18 @@ class SalesforceAdapter(CRMAdapter):
         "Presentacion__c, Capacidad__c, IVA__c, Unidades_por_caja__c"
     )
 
+    def _query_producto(self, where: str, todo: bool = False):
+        """Product2 con el nombre de la marca (Marca__r.Name); si la relación no existe en la org, repite sin ella."""
+        run = self.sf.query_all if todo else self.sf.query
+        try:
+            return run(f"SELECT {self._PRODUCTO_FIELDS}, Marca__r.Name FROM Product2 {where}")
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 400:
+                return run(f"SELECT {self._PRODUCTO_FIELDS} FROM Product2 {where}")
+            raise
+
     def get_productos(self) -> list[dict]:
-        records = self.sf.query_all(
-            f"SELECT {self._PRODUCTO_FIELDS} FROM Product2 WHERE IsActive = true"
-        )
+        records = self._query_producto("WHERE IsActive = true", todo=True)
         productos = [self._producto(r) for r in records]
 
         # Precios por lista: una entrada de `precios` por cada PricebookEntry activa (incluida la estándar).
@@ -508,9 +516,7 @@ class SalesforceAdapter(CRMAdapter):
         return productos
 
     def get_producto(self, record_id: str) -> dict:
-        data = self.sf.query(
-            f"SELECT {self._PRODUCTO_FIELDS} FROM Product2 WHERE Id = '{_safe_id(record_id)}' LIMIT 1"
-        )
+        data = self._query_producto(f"WHERE Id = '{_safe_id(record_id)}' LIMIT 1")
         records = data.get("records", [])
         if not records:
             raise ValueError(f"Producto {record_id} no encontrado")
@@ -522,7 +528,8 @@ class SalesforceAdapter(CRMAdapter):
             "nombre":           r.get("Name"),
             "codigo":           r.get("ProductCode"),
             "descripcion":      r.get("Description"),
-            "marca":            r.get("Marca__c"),
+            # Nombre de la marca (objeto Marca); None si el producto no tiene marca o la relación no está disponible.
+            "marca":            (r.get("Marca__r") or {}).get("Name"),
             "categoria":        r.get("Categoria__c"),
             "presentacion":     r.get("Presentacion__c"),
             "capacidad":        r.get("Capacidad__c"),
@@ -561,17 +568,29 @@ class SalesforceAdapter(CRMAdapter):
     def get_promos(self) -> list[dict]:
         # Solo activas y vigentes hoy (fecha en la zona horaria del tenant).
         hoy = datetime.now(self.zona).date().isoformat()
-        data = self.sf.query(
-            "SELECT Id, Name, Descripcion__c, Estado__c, Criterio__c, "
-            "FechaInicio__c, FechaFin__c, "
-            "(SELECT Id, Name, Product__c, Cantidad__c, TipoMedida__c, "
-            "Tipo__c, Tipo_descuento__c, Valor_descuento__c FROM PromosAcciones__r), "
-            "(SELECT Id, Name, Producto__c, Capacidad__c, Presentacion__c, "
-            "Operador__c, TipoMedida__c, Valor__c FROM PromosCondiciones__r) "
-            "FROM Promocion__c WHERE Estado__c = 'Activa' "
-            f"AND (FechaInicio__c = null OR FechaInicio__c <= {hoy}) "
-            f"AND (FechaFin__c = null OR FechaFin__c >= {hoy})"
-        )
+        def consulta(extra_cond: str) -> str:
+            return (
+                "SELECT Id, Name, Descripcion__c, Estado__c, Criterio__c, "
+                "FechaInicio__c, FechaFin__c, "
+                "(SELECT Id, Name, Product__c, Cantidad__c, TipoMedida__c, "
+                "Tipo__c, Tipo_descuento__c, Valor_descuento__c FROM PromosAcciones__r), "
+                "(SELECT Id, Name, Producto__c, Capacidad__c, Presentacion__c, "
+                f"Operador__c, TipoMedida__c, Valor__c{extra_cond} FROM PromosCondiciones__r) "
+                "FROM Promocion__c WHERE Estado__c = 'Activa' "
+                f"AND (FechaInicio__c = null OR FechaInicio__c <= {hoy}) "
+                f"AND (FechaFin__c = null OR FechaFin__c >= {hoy})"
+            )
+
+        # Marca y categoría de la condición (nombres). Si algún campo aún no existe en la org (400), se
+        # reintenta con menos campos: marca y/o categoría salen null en vez de romper GET /promos.
+        data = None
+        for extra in (", Marca__r.Name, Categoria__c", ", Marca__r.Name", ", Categoria__c", ""):
+            try:
+                data = self.sf.query(consulta(extra))
+                break
+            except HTTPError as e:
+                if extra == "" or e.response is None or e.response.status_code != 400:
+                    raise
         promos = data.get("records", [])
 
         # Listas de precios por promo (junction). Sin filas = aplica a todas las listas.
@@ -650,8 +669,8 @@ class SalesforceAdapter(CRMAdapter):
             "id":          c["Id"],
             "nombre":      c.get("Name"),
             "producto_id": c.get("Producto__c"),
-            "marca":       None,
-            "categoria":   None,
+            "marca":       (c.get("Marca__r") or {}).get("Name"),   # nombre de la marca; None si no filtra por marca
+            "categoria":   c.get("Categoria__c") or None,           # valor del picklist; None si no filtra
             "presentacion": c.get("Presentacion__c"),
             "capacidad":   c.get("Capacidad__c"),
             "medida":      med,
