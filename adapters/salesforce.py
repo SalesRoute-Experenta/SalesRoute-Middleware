@@ -262,15 +262,18 @@ class SalesforceAdapter(CRMAdapter):
 
     def _pedido_existente(self, vendedor_id: str | None, id_local: str) -> dict | None:
         """Pedido de la cartera del vendedor ya creado con ese id_local (UUID__c), para reintentos sin duplicar."""
-        soql = (f"SELECT Id, OrderNumber, Status, Total__c, TotalAmount, OriginalOrderId FROM Order "
-                f"WHERE UUID__c = '{id_local}' AND {self._pedidos_cartera(vendedor_id)} LIMIT 1")
-        try:
-            recs = self.sf.query(soql).get("records", [])
-        except HTTPError as e:
-            if e.response is not None and e.response.status_code == 400:
-                return None   # la org aún no tiene UUID__c
-            raise
-        return recs[0] if recs else None
+        cartera = self._pedidos_cartera(vendedor_id)
+        # Sin Pedido_Original__c si el campo aún no existe; sin UUID__c no hay idempotencia posible.
+        for campos in ("Id, OrderNumber, Status, Total__c, TotalAmount, Pedido_Original__c",
+                       "Id, OrderNumber, Status, Total__c, TotalAmount"):
+            try:
+                recs = self.sf.query(
+                    f"SELECT {campos} FROM Order WHERE UUID__c = '{id_local}' AND {cartera} LIMIT 1").get("records", [])
+                return recs[0] if recs else None
+            except HTTPError as e:
+                if e.response is None or e.response.status_code != 400:
+                    raise
+        return None
 
     def _validar_original(self, vendedor_id: str | None, original_id, cliente_id, tipo) -> dict:
         """Reglas 1 a 6 del clon: el original existe, es de la cartera, está sincronizado y no anulado, y coincide en cliente y tipo."""
@@ -306,8 +309,8 @@ class SalesforceAdapter(CRMAdapter):
                 total = previo.get("Total__c") if previo.get("Total__c") is not None else previo.get("TotalAmount")
                 resp = {"id": previo["Id"], "numero": previo.get("OrderNumber"), "estado": previo.get("Status"),
                         "id_local": id_local, "total": total}
-                if previo.get("OriginalOrderId"):
-                    resp.update({"pedido_original_id": previo["OriginalOrderId"], "original_anulado": True})
+                if previo.get("Pedido_Original__c"):
+                    resp.update({"pedido_original_id": previo["Pedido_Original__c"], "original_anulado": True})
                 return resp
         tipo_pedido = data.get("tipo")
         if tipo_pedido is not None and tipo_pedido not in self._TIPOS_PEDIDO:
@@ -425,7 +428,7 @@ class SalesforceAdapter(CRMAdapter):
             "AccountId": cliente_id, "Status": "Draft", "EffectiveDate": fecha, "Pricebook2Id": lista,
             "Type": (tipo or "nuevo").capitalize(),
             **({"UUID__c": id_local} if id_local else {}),
-            **({"OriginalOrderId": original_id} if original_id else {}),
+            **({"Pedido_Original__c": original_id} if original_id else {}),
             **({"CurrencyIsoCode": moneda} if moneda else {}),
             "Subtotal__c": float(t_sub), "Descuento__c": float(t_desc), "IVA__c": float(t_iva), "Total__c": float(t_total),
         })["id"]
