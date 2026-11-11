@@ -161,7 +161,7 @@ class ExperentaCRMAdapter(CRMAdapter):
 
     # ── Pendientes Fase 2 (objetos aún no en CRM) ─────────────────────────────
 
-    def get_productos(self) -> list[dict]:
+    def get_productos(self, vendedor_id: str | None = None) -> list[dict]:
         raise NotImplementedError("Productos: pendiente en CRM Experenta")
 
     def get_producto(self, record_id: str) -> dict:

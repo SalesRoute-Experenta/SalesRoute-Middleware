@@ -104,14 +104,14 @@ class SalesforceAdapter(CRMAdapter):
     def get_clientes(self, vendedor_id: str | None) -> list[dict]:
         records = self.sf.query_all(
             f"SELECT {self._CLIENTE_FIELDS} FROM Account "
-            f"WHERE {self._cartera(vendedor_id)} ORDER BY Name"
+            f"WHERE {self._cartera_venta(vendedor_id)} ORDER BY Name"
         )
         return [self._cliente(r) for r in records]
 
     def get_cliente(self, vendedor_id: str | None, record_id: str) -> dict:
         data = self.sf.query(
             f"SELECT {self._CLIENTE_FIELDS} FROM Account "
-            f"WHERE Id = '{_safe_id(record_id)}' AND {self._cartera(vendedor_id)} LIMIT 1"
+            f"WHERE Id = '{_safe_id(record_id)}' AND {self._cartera_venta(vendedor_id)} LIMIT 1"
         )
         records = data.get("records", [])
         if not records:
@@ -172,7 +172,7 @@ class SalesforceAdapter(CRMAdapter):
     # Los pedidos del vendedor son los de los clientes de su cartera (mismo filtro que /clientes).
     # Con ?cliente_id= de un cliente fuera de la cartera la lista sale vacía, sin revelar nada.
     def _pedidos_cartera(self, vendedor_id: str | None) -> str:
-        return f"AccountId IN (SELECT Id FROM Account WHERE {self._cartera(vendedor_id)})"
+        return f"AccountId IN (SELECT Id FROM Account WHERE {self._cartera_venta(vendedor_id)})"
 
     def get_pedidos(self, vendedor_id: str | None, cliente_id: str | None = None) -> list[dict]:
         filtro = self._pedidos_cartera(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulos
@@ -411,7 +411,7 @@ class SalesforceAdapter(CRMAdapter):
             raise
 
     def _cliente_de_cartera(self, vendedor_id: str | None, cliente_id) -> dict:
-        cartera = self._cartera(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulos
+        cartera = self._cartera_venta(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulos
         if not isinstance(cliente_id, str) or not _SF_ID_RE.match(cliente_id):
             raise ValueError(f"Cliente {cliente_id} no encontrado")
         recs = self._query_moneda(
@@ -424,7 +424,7 @@ class SalesforceAdapter(CRMAdapter):
     def _validar_cliente_en_cartera(self, vendedor_id: str | None, cliente_id) -> None:
         # Un pedido solo se crea para un cliente de la cartera del vendedor (mismo filtro que GET /clientes/{id}).
         # Cliente inexistente, con formato inválido o ajeno responden igual (404), sin revelar cuál es el caso.
-        cartera = self._cartera(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulos
+        cartera = self._cartera_venta(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulos
         if not isinstance(cliente_id, str) or not _SF_ID_RE.match(cliente_id):
             raise ValueError(f"Cliente {cliente_id} no encontrado")
         data = self.sf.query(f"SELECT Id FROM Account WHERE Id = '{cliente_id}' AND {cartera} LIMIT 1")
@@ -514,7 +514,8 @@ class SalesforceAdapter(CRMAdapter):
                 return run(f"SELECT {self._PRODUCTO_FIELDS} FROM Product2 {where}")
             raise
 
-    def get_productos(self) -> list[dict]:
+    def get_productos(self, vendedor_id: str | None = None) -> list[dict]:
+        moneda_vendedor = self._moneda_vendedor(vendedor_id)
         records = self._query_producto("WHERE IsActive = true", todo=True)
         productos = [self._producto(r) for r in records]
 
@@ -528,6 +529,8 @@ class SalesforceAdapter(CRMAdapter):
         estandar: dict[str, float] = {}
         for e in entries:
             pb = e.get("Pricebook2") or {}
+            if moneda_vendedor and e.get("CurrencyIsoCode") not in (None, moneda_vendedor):
+                continue   # el vendedor solo vende en su moneda
             if pb.get("IsStandard"):
                 estandar[e["Product2Id"]] = e.get("UnitPrice")   # y también sale en precios[]: un cliente puede tener asignado el estándar
             por_producto.setdefault(e["Product2Id"], []).append({
@@ -540,6 +543,8 @@ class SalesforceAdapter(CRMAdapter):
         for p in productos:
             p["precios"] = por_producto.get(p["id"], [])
             p["precio"] = estandar.get(p["id"])
+        if moneda_vendedor:
+            productos = [p for p in productos if p["precios"]]   # sin precio en su moneda no se puede vender
         return productos
 
     def get_producto(self, record_id: str) -> dict:
@@ -838,6 +843,30 @@ class SalesforceAdapter(CRMAdapter):
     def _cartera(self, vendedor_id: str | None) -> str:
         # Filtro SOQL de Account: la cartera del vendedor son las cuentas activas de sus módulos.
         return f"Activo__c = true AND Modulo__c IN ({self._modulos(vendedor_id)})"
+
+    def _moneda_vendedor(self, vendedor_id: str | None) -> str | None:
+        """Moneda de venta del vendedor: User.DefaultCurrencyIsoCode. None si la org no es multimoneda o el usuario no existe."""
+        if not vendedor_id:
+            return None
+        cache = self.__dict__.setdefault("_moneda_cache", {})
+        vid = _safe_id(vendedor_id)
+        if vid not in cache:
+            try:
+                recs = self.sf.query(f"SELECT DefaultCurrencyIsoCode FROM User WHERE Id = '{vid}' LIMIT 1").get("records") or []
+            except HTTPError as e:
+                if e.response is not None and e.response.status_code == 400:
+                    recs = []
+                else:
+                    raise
+            m = (recs[0].get("DefaultCurrencyIsoCode") if recs else None) or None
+            cache[vid] = m if isinstance(m, str) and re.match(r"^[A-Z]{3}$", m) else None
+        return cache[vid]
+
+    def _cartera_venta(self, vendedor_id: str | None) -> str:
+        """Cartera del vendedor limitada a su moneda de venta: un vendedor atiende una sola moneda."""
+        cartera = self._cartera(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulos
+        moneda = self._moneda_vendedor(vendedor_id)
+        return f"{cartera} AND CurrencyIsoCode = '{moneda}'" if moneda else cartera
 
     def _visitas_cartera(self, vendedor_id: str | None) -> str:
         # Filtro SOQL de Event: las visitas son las de los clientes de la cartera.
