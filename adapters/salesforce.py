@@ -150,24 +150,30 @@ class SalesforceAdapter(CRMAdapter):
     # ── Pedidos ───────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _pedido_fields(con_bonif_id: bool = True) -> str:
+    def _pedido_fields(con_bonif_id: bool = True, con_retorno: bool = True) -> str:
         extra = ", BonificacionId__c" if con_bonif_id else ""
+        if con_retorno:
+            extra += (", Tipo_Linea__c, Motivo_Retorno__c, Estado_Producto__c, Lote__c, "
+                      "Fecha_Vencimiento__c, Comentario__c")
+        tipo = ", Type" if con_retorno else ""
         return (
-            "Id, OrderNumber, Status, TotalAmount, AccountId, EffectiveDate, CreatedDate, "
-            "Subtotal__c, Descuento__c, IVA__c, Total__c, "
+            f"Id, OrderNumber, Status, TotalAmount, AccountId, EffectiveDate, CreatedDate, "
+            f"Subtotal__c, Descuento__c, IVA__c, Total__c{tipo}, "
             "(SELECT Product2Id, Product2.Name, Quantity, UnitPrice, TotalPrice, Descuento__c, "
             f"IVA_porcentaje__c, IVA__c, Total__c, Bonificacion__c, Promocion__c, Valor_lista__c{extra} FROM OrderItems)"
         )
 
     def _query_pedidos(self, tail: str, todo: bool = False):
-        """Consulta de pedidos; si OrderItem.BonificacionId__c aún no existe en la org (400), repite sin él."""
+        """Consulta de pedidos. Si algún campo opcional aún no existe en la org (400), repite con menos campos:
+        primero sin los de cambio y devolución, y al final también sin BonificacionId__c."""
         run = self.sf.query_all if todo else self.sf.query
-        try:
-            return run(f"SELECT {self._pedido_fields(True)} FROM Order {tail}")
-        except HTTPError as e:
-            if e.response is not None and e.response.status_code == 400:
-                return run(f"SELECT {self._pedido_fields(False)} FROM Order {tail}")
-            raise
+        variantes = ((True, True), (True, False), (False, False))
+        for k, (bonif, retorno) in enumerate(variantes):
+            try:
+                return run(f"SELECT {self._pedido_fields(bonif, retorno)} FROM Order {tail}")
+            except HTTPError as e:
+                if e.response is None or e.response.status_code != 400 or k == len(variantes) - 1:
+                    raise
 
     # Los pedidos del vendedor son los de los clientes de su cartera (mismo filtro que /clientes).
     # Con ?cliente_id= de un cliente fuera de la cartera la lista sale vacía, sin revelar nada.
@@ -260,6 +266,13 @@ class SalesforceAdapter(CRMAdapter):
     # ── POST /pedidos con totales (contrato nuevo, `lineas`) ──────────────────
 
     _TIPOS_PEDIDO = ("nuevo", "cambio", "devolucion")
+    # Listas de valores de las líneas de cambio y devolución (texto exacto del picklist en Salesforce).
+    _MOTIVOS_RETORNO = ("Vencido o próximo a vencer", "Dañado en transporte", "Defecto de fábrica",
+                        "Producto equivocado entregado", "Empaque en mal estado", "Rechazo del cliente",
+                        "Sobreinventario", "Otro")
+    _ESTADOS_PRODUCTO = ("Vencido", "Dañado", "Roto", "Buen estado")
+    _TIPOS_LINEA = ("Devuelto", "Entregado")
+    _CAMPOS_RETORNO = ("motivo_retorno", "estado_producto", "lote", "fecha_vencimiento", "tipo_linea", "comentario_linea")
 
     @staticmethod
     def _dec(v, campo: str) -> Decimal:
@@ -396,6 +409,7 @@ class SalesforceAdapter(CRMAdapter):
             if precio != (cero if bonif else precio_lista):
                 esperado = "0 en una bonificación" if bonif else f"{precio_lista} (precio de la lista)"
                 raise ValueError(f"Dato inválido: {n}: precio_unitario debe ser {esperado}")
+            retorno = self._validar_retorno(n, l, tipo_pedido)
             promo = l.get("promo_id")
             bid = l.get("bonificacion_id")
             for campo, v in (("promo_id", promo), ("bonificacion_id", bid)):
@@ -436,7 +450,9 @@ class SalesforceAdapter(CRMAdapter):
             t_iva += iva
             filas.append({"pid": pid, "entry": entrada["Id"], "cant": cant, "precio": precio, "desc": desc, "pct": pct,
                           "iva": iva, "total": total, "bonif": bonif, "promo": promo, "valor_lista": valor_lista,
-                          "bid": bid})
+                          "bid": bid, "retorno": retorno})
+        if tipo_pedido == "cambio" and {f["retorno"].get("Tipo_Linea__c") for f in filas} != {"Devuelto", "Entregado"}:
+            raise ValueError("Dato inválido: un pedido de cambio necesita al menos una línea Devuelto y una Entregado")
         t_total = t_sub - t_desc + t_iva
         for campo, calc in (("subtotal", t_sub), ("descuento", t_desc), ("iva", t_iva), ("total", t_total)):
             if self._dec(data.get(campo), campo) != calc:
@@ -465,6 +481,7 @@ class SalesforceAdapter(CRMAdapter):
                     item["Valor_lista__c"] = float(f["valor_lista"])
                 if f["bid"]:
                     item["BonificacionId__c"] = f["bid"]
+                item.update(f["retorno"])
                 self._crear("OrderItem", item)
             self.sf.update("Order", order_id, {"Status": "Activated"})
             if original_id:
@@ -490,6 +507,61 @@ class SalesforceAdapter(CRMAdapter):
         if original_id:
             resp.update({"pedido_original_id": original_id, "original_anulado": True})
         return resp
+
+    def _validar_retorno(self, n: str, l: dict, tipo_pedido: str | None) -> dict:
+        """Campos por línea de cambio y devolución (contrato 10.1). Devuelve el payload de OrderItem.
+
+        En pedidos nuevo se rechazan si traen valor. En cambio y devolución no hay promociones ni descuentos."""
+        if tipo_pedido not in ("cambio", "devolucion"):
+            for c in self._CAMPOS_RETORNO:
+                if l.get(c) is not None:
+                    raise ValueError(f"Dato inválido: {n}: {c} solo va en pedidos de cambio o devolucion")
+            return {}
+        if l.get("bonificacion") or l.get("promo_id") or l.get("bonificacion_id"):
+            raise ValueError(f"Dato inválido: {n}: un pedido de {tipo_pedido} no admite promociones ni bonificaciones")
+        if self._dec(l.get("descuento", 0), f"{n}: descuento") != 0:
+            raise ValueError(f"Dato inválido: {n}: un pedido de {tipo_pedido} no admite descuentos")
+        tl = l.get("tipo_linea")
+        if tl is None:
+            if tipo_pedido == "cambio":
+                raise ValueError(f"Campo requerido: {n}: tipo_linea (Devuelto o Entregado)")
+            tl = "Devuelto"
+        if tl not in self._TIPOS_LINEA or (tipo_pedido == "devolucion" and tl != "Devuelto"):
+            validos = "Devuelto o Entregado" if tipo_pedido == "cambio" else "Devuelto"
+            raise ValueError(f"Dato inválido: {n}: tipo_linea debe ser {validos}")
+        out = {"Tipo_Linea__c": tl}
+        motivo, estado = l.get("motivo_retorno"), l.get("estado_producto")
+        if tl == "Entregado":
+            if motivo is not None or estado is not None:
+                raise ValueError(f"Dato inválido: {n}: una línea Entregado no lleva motivo_retorno ni estado_producto")
+        else:
+            if motivo is None:
+                raise ValueError(f"Campo requerido: {n}: motivo_retorno")
+            if motivo not in self._MOTIVOS_RETORNO:
+                raise ValueError(f"Dato inválido: {n}: motivo_retorno no es un valor válido")
+            if estado is None:
+                raise ValueError(f"Campo requerido: {n}: estado_producto")
+            if estado not in self._ESTADOS_PRODUCTO:
+                raise ValueError(f"Dato inválido: {n}: estado_producto no es un valor válido")
+            out["Motivo_Retorno__c"], out["Estado_Producto__c"] = motivo, estado
+        lote, fv, com = l.get("lote"), l.get("fecha_vencimiento"), l.get("comentario_linea")
+        if lote is not None:
+            if not isinstance(lote, str) or not lote.strip() or len(lote) > 50:
+                raise ValueError(f"Dato inválido: {n}: lote debe ser texto de 1 a 50 caracteres")
+            out["Lote__c"] = lote
+        if fv is not None:
+            if not isinstance(fv, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", fv):
+                raise ValueError(f"Dato inválido: {n}: fecha_vencimiento debe ser YYYY-MM-DD")
+            try:
+                date.fromisoformat(fv)
+            except ValueError:
+                raise ValueError(f"Dato inválido: {n}: fecha_vencimiento no es una fecha válida")
+            out["Fecha_Vencimiento__c"] = fv
+        if com is not None:
+            if not isinstance(com, str) or len(com) > 255:
+                raise ValueError(f"Dato inválido: {n}: comentario_linea debe ser texto de hasta 255 caracteres")
+            out["Comentario__c"] = com
+        return out
 
     def _query_moneda(self, soql, todo: bool = False):
         """Consulta con CurrencyIsoCode; si la org no es multimoneda (campo inexistente) repite sin él."""
@@ -601,6 +673,7 @@ class SalesforceAdapter(CRMAdapter):
             "id":         r["Id"],
             "numero":     r.get("OrderNumber"),
             "estado":     r.get("Status"),
+            "tipo":       (r.get("Type") or "").lower() or None,
             "reemplazado_por_id": reemplazado_por_id,
             # Total__c = total real (con descuento e IVA); TotalAmount de Salesforce es solo Σ precio × cantidad.
             "total":      r.get("Total__c") if r.get("Total__c") is not None else r.get("TotalAmount"),
@@ -624,6 +697,12 @@ class SalesforceAdapter(CRMAdapter):
                     "promo_id":        i.get("Promocion__c"),
                     "valor_lista":     i.get("Valor_lista__c"),
                     "bonificacion_id": i.get("BonificacionId__c"),
+                    "tipo_linea":      i.get("Tipo_Linea__c"),
+                    "motivo_retorno":  i.get("Motivo_Retorno__c"),
+                    "estado_producto": i.get("Estado_Producto__c"),
+                    "lote":            i.get("Lote__c"),
+                    "fecha_vencimiento": i.get("Fecha_Vencimiento__c"),
+                    "comentario_linea": i.get("Comentario__c"),
                 }
                 for i in items
             ],
