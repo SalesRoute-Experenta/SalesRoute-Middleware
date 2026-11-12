@@ -216,7 +216,7 @@
         "method": "GET",
         "header": [],
         "url": "{{baseUrl}}/promos",
-        "description": "Solo promos activas y vigentes hoy. Cada una trae listas_precios_id (vacío = todas), condiciones_relacion, condiciones (medida, operador, valor) y acciones (tipo, unidad, descuento_tipo, descuento_valor)."
+        "description": "Solo promos activas y vigentes hoy. Cada una trae listas_precios_ids (vacío = todas), condiciones_relacion, condiciones (medida, operador, valor) y acciones (tipo, unidad, descuento_tipo, descuento_valor)."
       },
       "event": [
         {
@@ -227,7 +227,7 @@
               "pm.test('200', () => pm.response.to.have.status(200));",
               "const ps = pm.response.json();",
               "pm.test('es un arreglo', () => pm.expect(ps).to.be.an('array'));",
-              "pm.test('estructura de cada promo', () => ps.forEach(p => { ['id','nombre','fecha_inicio','fecha_fin','listas_precios_id','condiciones_relacion','condiciones','acciones'].forEach(k => pm.expect(p).to.have.property(k)); pm.expect(p.listas_precios_id).to.be.an('array'); }));",
+              "pm.test('estructura de cada promo', () => ps.forEach(p => { ['id','nombre','fecha_inicio','fecha_fin','listas_precios_ids','condiciones_relacion','condiciones','acciones'].forEach(k => pm.expect(p).to.have.property(k)); pm.expect(p.listas_precios_ids).to.be.an('array'); }));",
               "pm.test('operador y medida normalizados', () => ps.forEach(p => p.condiciones.forEach(c => { pm.expect(['por_cada','igual','mayor','mayor_igual','menor','menor_igual']).to.include(c.operador); pm.expect(['unidades','cajas','monto']).to.include(c.medida); })));",
               "pm.test('acciones: tipo y unidad', () => ps.forEach(p => p.acciones.forEach(a => { pm.expect(['bonificacion','descuento']).to.include(a.tipo); if (a.tipo === 'bonificacion') pm.expect(['unidades','cajas']).to.include(a.unidad); })));"
             ]
