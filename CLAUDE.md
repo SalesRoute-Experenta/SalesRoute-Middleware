@@ -88,6 +88,8 @@ El vendedor se identifica solo por el claim `custom:vendedor_id` de su ID token 
 
 Su cartera son las cuentas activas con `Account.Modulo__c` en alguno de sus módulos (`Modulo__c.Vendedor__c` = vendedor); sin módulo asignado responde 403. En CRM Experenta no hay módulos y `/clientes` no filtra.
 
+**Una moneda por vendedor (Salesforce):** el vendedor vende en `User.DefaultCurrencyIsoCode`. `GET /clientes`, `/pedidos` y `POST /pedidos` solo ven clientes de esa moneda (`Account.CurrencyIsoCode`) y `GET /productos` solo trae precios en ella. Si su usuario no tiene moneda válida, esos endpoints responden 403 `El vendedor <id> no tiene moneda de venta configurada`: no puede sincronizar. Solo si la org no es multimoneda (el campo no existe) no se filtra nada.
+
 ### Visitas (Salesforce `Event`)
 
 Las visitas se traen a partir de la cartera: son los Events cuyo `WhatId` es un cliente de la cartera del vendedor (Account activo de sus módulos; el mismo filtro de `/clientes`), sin importar el `OwnerId`. Un vendedor solo ve y marca las visitas de sus clientes. `GET /visitas` trae solo las de hoy, calculado con el `utc_offset` del secreto del tenant (default `-06:00`, Honduras).

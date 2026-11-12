@@ -1056,7 +1056,9 @@ class SalesforceAdapter(CRMAdapter):
         return f"Activo__c = true AND Modulo__c IN ({self._modulos(vendedor_id)})"
 
     def _moneda_vendedor(self, vendedor_id: str | None) -> str | None:
-        """Moneda de venta del vendedor: User.DefaultCurrencyIsoCode. None si la org no es multimoneda o el usuario no existe."""
+        """Moneda de venta del vendedor: User.DefaultCurrencyIsoCode. None si la org no es multimoneda o el usuario no existe.
+
+        En una org multimoneda, un vendedor sin moneda válida no puede sincronizar: PermissionError (403)."""
         if not vendedor_id:
             return None
         cache = self.__dict__.setdefault("_moneda_cache", {})
@@ -1070,7 +1072,10 @@ class SalesforceAdapter(CRMAdapter):
                 else:
                     raise
             m = (recs[0].get("DefaultCurrencyIsoCode") if recs else None) or None
-            cache[vid] = m if isinstance(m, str) and re.match(r"^[A-Z]{3}$", m) else None
+            valida = isinstance(m, str) and re.match(r"^[A-Z]{3}$", m)
+            if recs and not valida:
+                raise PermissionError(f"El vendedor {vid} no tiene moneda de venta configurada")
+            cache[vid] = m if valida else None
         return cache[vid]
 
     def _cartera_venta(self, vendedor_id: str | None) -> str:
