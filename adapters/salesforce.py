@@ -96,7 +96,7 @@ class SalesforceAdapter(CRMAdapter):
     _CLIENTE_FIELDS = (
         "Id, Name, Nombre_de_negocio__c, Phone, Id_Externo__c, ParentId, "
         "ShippingStreet, ShippingCity, ShippingState, ShippingPostalCode, ShippingCountry, "
-        "ShippingLatitude, ShippingLongitude, "
+        "Location__Latitude__s, Location__Longitude__s, "
         "Dias_de_visita__c, Price_Book__c, Price_Book__r.Name"
     )
 
@@ -139,8 +139,8 @@ class SalesforceAdapter(CRMAdapter):
             "nombre_negocio":  r.get("Nombre_de_negocio__c"),
             "tel":             r.get("Phone"),
             "direccion":   direccion,
-            "lat":         r.get("ShippingLatitude"),
-            "lng":         r.get("ShippingLongitude"),
+            "lat":         r.get("Location__Latitude__s"),
+            "lng":         r.get("Location__Longitude__s"),
             "dias_visita": dias,
             # Lista de precios del cliente (Pricebook2). null = sin lista: la app no le permite crear pedidos.
             "lista_precios_id": r.get("Price_Book__c"),
