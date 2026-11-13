@@ -1,9 +1,15 @@
 import zipfile, os
 
-BASE = r"D:\nugo-standard-middleware"
+# Código propio: la carpeta de este script (sirve también desde un git worktree).
+BASE = os.path.dirname(os.path.abspath(__file__))
 OUT  = os.path.join(BASE, "function.zip")
+# Dependencias (package/ no está versionado): por defecto BASE/package; en un worktree apunta
+# PACKAGE_DIR al package/ del repo principal (ej. D:\nugo-standard-middleware\package).
+PACKAGE_DIR = os.environ.get("PACKAGE_DIR") or os.path.join(BASE, "package")
+if not os.path.isdir(PACKAGE_DIR):
+    raise SystemExit(f"No existe {PACKAGE_DIR}: corre 'pip install -r requirements.txt -t package/' o define PACKAGE_DIR")
 
-EXCLUDE_FROM_PACKAGE = {"handler.py", "sf_client.py", "secrets_manager.py", "adapters"}
+EXCLUDE_FROM_PACKAGE = {"handler.py", "sf_client.py", "secrets_manager.py", "promos_dynamo.py", "adapters"}
 
 def add_dir(zf, src_dir, arc_prefix="", exclude_top=None):
     exclude_top = exclude_top or set()
@@ -25,11 +31,11 @@ def add_dir(zf, src_dir, arc_prefix="", exclude_top=None):
 
 with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as zf:
     # archivos raíz
-    for f in ["handler.py", "sf_client.py", "secrets_manager.py"]:
+    for f in ["handler.py", "sf_client.py", "secrets_manager.py", "promos_dynamo.py"]:
         zf.write(os.path.join(BASE, f), f)
     # adapters/ tal cual (versión actualizada)
     add_dir(zf, os.path.join(BASE, "adapters"), "adapters")
     # package/ aplanado, sin sobreescribir los archivos propios
-    add_dir(zf, os.path.join(BASE, "package"), "", exclude_top=EXCLUDE_FROM_PACKAGE)
+    add_dir(zf, PACKAGE_DIR, "", exclude_top=EXCLUDE_FROM_PACKAGE)
 
 print(f"ZIP creado: {OUT}")

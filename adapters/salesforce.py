@@ -86,6 +86,10 @@ def _location(ubicaciones: dict[str, tuple[float, float]]) -> str:
 
 class SalesforceAdapter(CRMAdapter):
 
+    # Fuente de promos externa (promos_dynamo.PromosDynamo) si el tenant tiene promos_source="dynamodb".
+    # None = promos en Salesforce (Promocion__c). La asigna handler.py.
+    promos_externas = None
+
     def __init__(self, creds: dict):
         self.sf = SalesforceClient(creds)
         self.zona = _zona(creds.get("utc_offset", _UTC_OFFSET_DEFAULT))
@@ -150,8 +154,11 @@ class SalesforceAdapter(CRMAdapter):
     # ── Pedidos ───────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _pedido_fields(con_bonif_id: bool = True, con_retorno: bool = True) -> str:
+    def _pedido_fields(con_bonif_id: bool = True, con_retorno: bool = True, con_externa: bool = True) -> str:
         extra = ", BonificacionId__c" if con_bonif_id else ""
+        if con_externa:
+            # Ids de promos de DynamoDB (texto): Promocion__c es lookup y no acepta ULID.
+            extra += ", Promocion_Externa_Id__c, Bonificacion_Externa_Id__c"
         if con_retorno:
             extra += (", Tipo_Linea__c, Motivo_Retorno__c, Estado_Producto__c, Lote__c, "
                       "Fecha_Vencimiento__c, Comentario__c")
@@ -165,12 +172,13 @@ class SalesforceAdapter(CRMAdapter):
 
     def _query_pedidos(self, tail: str, todo: bool = False):
         """Consulta de pedidos. Si algún campo opcional aún no existe en la org (400), repite con menos campos:
-        primero sin los de cambio y devolución, y al final también sin BonificacionId__c."""
+        primero sin los Ids externos de promos, luego sin los de cambio y devolución, y al final también
+        sin BonificacionId__c."""
         run = self.sf.query_all if todo else self.sf.query
-        variantes = ((True, True), (True, False), (False, False))
-        for k, (bonif, retorno) in enumerate(variantes):
+        variantes = ((True, True, True), (True, True, False), (True, False, False), (False, False, False))
+        for k, (bonif, retorno, externa) in enumerate(variantes):
             try:
-                return run(f"SELECT {self._pedido_fields(bonif, retorno)} FROM Order {tail}")
+                return run(f"SELECT {self._pedido_fields(bonif, retorno, externa)} FROM Order {tail}")
             except HTTPError as e:
                 if e.response is None or e.response.status_code != 400 or k == len(variantes) - 1:
                     raise
@@ -381,15 +389,20 @@ class SalesforceAdapter(CRMAdapter):
                 entradas[e["Product2Id"]] = e
         iva_prod = {p["Id"]: p.get("IVA__c") for p in self.sf.query_all(
             f"SELECT Id, IVA__c FROM Product2 WHERE Id IN ({in_ids})")}
-        promo_ids = sorted({v for l in lineas for v in (l.get("promo_id"), l.get("bonificacion_id")) if v and isinstance(v, str) and _SF_ID_RE.match(v)})
+        externas = self.promos_externas
+        es_id_promo = externas.es_id if externas else (lambda v: isinstance(v, str) and bool(_SF_ID_RE.match(v)))
+        promo_ids = sorted({v for l in lineas for v in (l.get("promo_id"), l.get("bonificacion_id")) if v and es_id_promo(v)})
         vigentes: set[str] = set()
         if promo_ids:
-            in_promos = ", ".join(f"'{_safe_id(x)}'" for x in promo_ids)
             hoy = datetime.now(self.zona).date().isoformat()
-            vigentes = {p["Id"] for p in self.sf.query_all(
-                "SELECT Id FROM Promocion__c WHERE Estado__c = 'Activa' "
-                f"AND (FechaInicio__c = null OR FechaInicio__c <= {hoy}) AND (FechaFin__c = null OR FechaFin__c >= {hoy}) "
-                f"AND Id IN ({in_promos})")}
+            if externas:
+                vigentes = externas.vigentes(promo_ids, hoy)
+            else:
+                in_promos = ", ".join(f"'{_safe_id(x)}'" for x in promo_ids)
+                vigentes = {p["Id"] for p in self.sf.query_all(
+                    "SELECT Id FROM Promocion__c WHERE Estado__c = 'Activa' "
+                    f"AND (FechaInicio__c = null OR FechaInicio__c <= {hoy}) AND (FechaFin__c = null OR FechaFin__c >= {hoy}) "
+                    f"AND Id IN ({in_promos})")}
 
         cero = Decimal("0.00")
         t_sub = t_desc = t_iva = cero
@@ -413,7 +426,7 @@ class SalesforceAdapter(CRMAdapter):
             promo = l.get("promo_id")
             bid = l.get("bonificacion_id")
             for campo, v in (("promo_id", promo), ("bonificacion_id", bid)):
-                if v is not None and (not isinstance(v, str) or not _SF_ID_RE.match(v)):
+                if v is not None and not es_id_promo(v):
                     raise ValueError(f"Dato inválido: {n}: {campo} inválido")
             if bonif:
                 # La bonificación lleva el Id de la promo que la otorga en bonificacion_id; promo_id es solo para descuentos.
@@ -476,11 +489,11 @@ class SalesforceAdapter(CRMAdapter):
                     "IVA__c": float(f["iva"]), "Total__c": float(f["total"]), "Bonificacion__c": f["bonif"],
                 }
                 if f["promo"]:
-                    item["Promocion__c"] = f["promo"]
+                    item["Promocion_Externa_Id__c" if externas else "Promocion__c"] = f["promo"]
                 if f["valor_lista"] is not None:
                     item["Valor_lista__c"] = float(f["valor_lista"])
                 if f["bid"]:
-                    item["BonificacionId__c"] = f["bid"]
+                    item["Bonificacion_Externa_Id__c" if externas else "BonificacionId__c"] = f["bid"]
                 item.update(f["retorno"])
                 self._crear("OrderItem", item)
             self.sf.update("Order", order_id, {"Status": "Activated"})
@@ -694,9 +707,9 @@ class SalesforceAdapter(CRMAdapter):
                     "iva_porcentaje":  i.get("IVA_porcentaje__c"),
                     "iva":             i.get("IVA__c"),
                     "bonificacion":    bool(i.get("Bonificacion__c")),
-                    "promo_id":        i.get("Promocion__c"),
+                    "promo_id":        i.get("Promocion__c") or i.get("Promocion_Externa_Id__c"),
                     "valor_lista":     i.get("Valor_lista__c"),
-                    "bonificacion_id": i.get("BonificacionId__c"),
+                    "bonificacion_id": i.get("BonificacionId__c") or i.get("Bonificacion_Externa_Id__c"),
                     "tipo_linea":      i.get("Tipo_Linea__c"),
                     "motivo_retorno":  i.get("Motivo_Retorno__c"),
                     "estado_producto": i.get("Estado_Producto__c"),
@@ -806,11 +819,21 @@ class SalesforceAdapter(CRMAdapter):
             "cliente_id": r.get("AccountId"),
         }
 
+    # ── Listas de precios ─────────────────────────────────────────────────────
+
+    def get_listas_precios(self) -> list[dict]:
+        # Catálogo para el gestor web de promociones: listas activas (no depende del vendedor).
+        recs = self.sf.query_all("SELECT Id, Name, IsActive, IsStandard FROM Pricebook2 WHERE IsActive = true ORDER BY Name")
+        return [{"id": r["Id"], "nombre": r.get("Name"), "activa": bool(r.get("IsActive")),
+                 "es_estandar": bool(r.get("IsStandard"))} for r in recs]
+
     # ── Promos ────────────────────────────────────────────────────────────────
 
     def get_promos(self) -> list[dict]:
         # Solo activas y vigentes hoy (fecha en la zona horaria del tenant).
         hoy = datetime.now(self.zona).date().isoformat()
+        if self.promos_externas:
+            return self.promos_externas.get_promos(hoy)
         def consulta(extra_cond: str) -> str:
             return (
                 "SELECT Id, Name, Descripcion__c, Estado__c, Criterio__c, "

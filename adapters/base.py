@@ -43,6 +43,9 @@ class CRMAdapter(ABC):
     @abstractmethod
     def get_promos(self) -> list[dict]: ...
 
+    def get_listas_precios(self) -> list[dict]:
+        raise NotImplementedError("Listas de precios: no disponible en este CRM")
+
     @abstractmethod
     def get_prospectos(self) -> list[dict]: ...
 

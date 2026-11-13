@@ -41,6 +41,8 @@ Cada tenant tiene un secreto con esta forma mínima:
 
 Opcional: `"utc_offset": "-06:00"` define la zona horaria del tenant para `GET /visitas`.
 
+Opcional: `"promos_source": "salesforce" | "dynamodb"` (default `salesforce`). Con `dynamodb` las promos salen de la tabla del gestor web `promos-app` (ver "Fuente de promociones"). Cualquier otro valor da 500 al cargar el tenant.
+
 Para `experenta_crm`:
 
 ```json
@@ -73,6 +75,7 @@ Para `experenta_crm`:
 | GET    | /productos         | Productos activos con `marca`, `categoria`, `presentacion`, `capacidad`, `iva_porcentaje` (`Product2.IVA__c`), `unidades_por_caja` y `precios[]`: un elemento por lista de precios (incluida la estándar) con `lista_precios_id`, `lista_precios`, `precio` (`UnitPrice`) y `precio_caja` (`List_Box_Price__c`). `precio` (nivel producto) se mantiene por compatibilidad y sale del Pricebook estándar. Requiere los campos nuevos de `Product2` y `PricebookEntry` legibles por la integración |
 | GET    | /productos/{id}    | Producto por ID (mismos atributos, sin `precios`) |
 | GET    | /promos            | Promociones activas y vigentes hoy (fecha en la zona del tenant), con `listas_precios_ids` (de la junction `Promocion_lista_precios__c`; vacío = todas las listas), `condiciones_relacion` ("todas"), `condiciones` (`medida` unidades/cajas/monto, `operador` normalizado por_cada/igual/mayor/mayor_igual/menor/menor_igual, `valor`, filtros) y `acciones` (`tipo` bonificacion/descuento, `cantidad`, `unidad` unidades/cajas desde `TipoMedida__c`, `descuento_tipo`, `descuento_valor`). Se mantienen los campos anteriores (`estado`, `criterio`, `tipo_medida`, `marca_id`). Requiere `Tipo__c`, `Tipo_descuento__c` y `Valor_descuento__c` en la acción y la junction con `Promocion__c` y `Price_Book__c` |
+| GET    | /listas-precios    | Listas de precios activas (`Pricebook2 WHERE IsActive = true`): `[{id, nombre, activa, es_estandar}]`. No depende de `custom:vendedor_id`. Catálogo del gestor web de promociones |
 | GET    | /prospectos        | Lista prospectos              |
 | POST   | /prospectos        | Crear prospecto               |
 | PUT    | /prospectos/{id}   | Actualizar prospecto          |
@@ -115,6 +118,23 @@ Body de `PUT /visitas/{id}`:
 - Check out: `{"fecha_fin", "lat_fin", "lng_fin", "estado": "completada" | "sin_compra"}`. Requiere check in previo (o en el mismo body) y `fecha_fin >= fecha_inicio`.
 - Fechas ISO 8601 con zona horaria. `GET /visitas` devuelve `fecha_inicio` y `fecha_fin` (null sin check in / check out) para que la app sepa qué visitas están en curso o cerradas, pero no coordenadas; `GET /visitas/{id}` devuelve todo.
 
+### Fuente de promociones (Salesforce o DynamoDB)
+
+Por tenant, según `promos_source` del secreto. Con `dynamodb`, `handler.py` asigna `adapter.promos_externas = PromosDynamo(tenant_id)` (`promos_dynamo.py`):
+
+- Tabla `PROMOS_TABLE` (env var), escrita solo por el gestor web `C:\Users\Angel's PC\promos-app`. `PK = TENANT#<tenant_id>` (siempre el claim del token), `SK = PROMO#<ulid>`, promo embebida.
+- `GET /promos` emite el mismo JSON que `_promo()` de Salesforce (mismos filtros: Activa, vigente hoy en `utc_offset`, ≥1 condición y ≥1 acción con tipo). Decimal de DynamoDB sale como float, igual que Salesforce.
+- `POST /pedidos`: `promo_id`/`bonificacion_id` deben ser ULID (26 caracteres) vigentes del tenant; un Id de Salesforce da 400 `inválido`. Se guardan en `OrderItem.Promocion_Externa_Id__c` / `Bonificacion_Externa_Id__c` (texto), porque `Promocion__c` es lookup. `GET /pedidos` devuelve `promo_id`/`bonificacion_id` del campo que tenga valor; si la org no tiene los campos externos, `_query_pedidos` reintenta sin ellos (primer fallback de 4).
+- Rollback: `promos_source` a `salesforce` (los pedidos ya creados conservan su id externo).
+- `PromosDynamo` abre la tabla al primer uso: si falta `PROMOS_TABLE`, solo `GET /promos` y `POST /pedidos` con promo dan 500; el resto del tenant sigue funcionando.
+
+**Checklist antes de poner un tenant en `promos_source=dynamodb`** (en este orden):
+1. Campos texto `OrderItem.Promocion_Externa_Id__c` y `OrderItem.Bonificacion_Externa_Id__c` creados y con permiso de escritura para la integración (sin ellos el create de OrderItem da 400 y el pedido se deshace).
+2. Lambda con env var `PROMOS_TABLE` y permiso IAM `dynamodb:Query` y `dynamodb:GetItem` sobre la tabla.
+3. Promos migradas a DynamoDB (`promos-app/scripts/migrar-desde-salesforce.ts`) y revisadas en el gestor web.
+4. Vendedores del tenant con todos sus pedidos pendientes sincronizados: un pedido offline con `promo_id` de Salesforce recibe 400 `promo_id inválido` después del cambio.
+5. Cambiar el secreto y probar `GET /promos` y un `POST /pedidos` con promo en Postman.
+
 ## Seguridad
 
 - IDs de Salesforce validados con regex `^[a-zA-Z0-9]{15,18}$` antes de cualquier query.
@@ -129,10 +149,11 @@ python build_zip.py
 aws lambda update-function-code --function-name nugo-standard-middleware --zip-file fileb://function.zip --region us-east-2
 ```
 
-`build_zip.py` construye el ZIP correctamente: incluye `adapters/` desde el código fuente y aplana `package/` en la raíz, evitando que dependencias antiguas en `package/` sobreescriban el código propio.
+`build_zip.py` empaqueta el código de su propia carpeta (sirve desde un git worktree). `package/` no está versionado: en un worktree usa `PACKAGE_DIR=D:\nugo-standard-middleware\package python build_zip.py`. Construye el ZIP correctamente: incluye `adapters/` desde el código fuente y aplana `package/` en la raíz, evitando que dependencias antiguas en `package/` sobreescriban el código propio.
 
 ## Variables de entorno Lambda
 
 | Variable    | Descripción                        |
 |-------------|------------------------------------|
 | `MOCK_MODE` | `true` activa respuestas simuladas |
+| `PROMOS_TABLE` | Tabla DynamoDB del gestor web (`nugo-promociones-<env>`). Requerida si algún tenant tiene `promos_source=dynamodb` |
