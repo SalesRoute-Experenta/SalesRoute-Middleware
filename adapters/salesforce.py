@@ -94,6 +94,11 @@ class SalesforceAdapter(CRMAdapter):
         self.sf = SalesforceClient(creds)
         self.zona = _zona(creds.get("utc_offset", _UTC_OFFSET_DEFAULT))
         self._pricebook_id_cache: str | None = None
+        # Estados de Lead que no se muestran al vendedor (descartados por la oficina). Lista en el secreto del tenant.
+        self.prospectos_status_ocultos = creds.get("prospectos_status_ocultos") or []
+        # Origen (LeadSource) de los Leads que crea la app; GET /prospectos solo muestra esos.
+        # "" en el secreto = sin filtro por origen (todos los Leads del vendedor).
+        self.prospectos_lead_source = creds.get("prospectos_lead_source", self._LEAD_SOURCE)
 
     # ── Clientes ──────────────────────────────────────────────────────────────
 
@@ -948,36 +953,207 @@ class SalesforceAdapter(CRMAdapter):
 
     # ── Prospectos ────────────────────────────────────────────────────────────
 
-    def get_prospectos(self) -> list[dict]:
-        data = self.sf.query(
-            "SELECT Id, FirstName, LastName, Company, Phone, Email, Status FROM Lead ORDER BY CreatedDate DESC"
-        )
-        return [self._prospecto(r) for r in data.get("records", [])]
+    # Prospecto = Lead del vendedor (OwnerId) no convertido. Solo campos estándar salvo los que no tienen
+    # equivalente: UUID__c, Identificacion_Fiscal__c, Referencia__c, Location__c, Dias_de_visita__c, Tipo_negocio__c.
+    # Status no lo envía la app ni el Middleware: Salesforce pone el valor por defecto de la org y lo maneja la oficina.
+    # Campos de texto: campo API -> (campo Lead, largo máximo, obligatorio).
+    _PROSPECTO_TEXTOS = {
+        "nombre_negocio":        ("Company", 255, True),
+        "contacto":              ("LastName", 80, True),
+        "identificacion_fiscal": ("Identificacion_Fiscal__c", 20, False),
+        "telefono":              ("Phone", 40, True),
+        "telefono_alternativo":  ("MobilePhone", 40, False),
+        "direccion":             ("Street", 255, True),
+        "referencia":            ("Referencia__c", 255, False),
+        "notas":                 ("Description", 255, False),
+    }
+    _PROSPECTO_OTROS = ("id_local", "lat", "lng", "dias_visita", "tipo_negocio")
+    _PROSPECTO_FIELDS = (
+        "Id, UUID__c, Company, LastName, Identificacion_Fiscal__c, Phone, MobilePhone, Street, Referencia__c, "
+        "Location__Latitude__s, Location__Longitude__s, Dias_de_visita__c, Tipo_negocio__c, Description, CreatedDate"
+    )
+    _LEAD_SOURCE = "App NUGO"
 
-    def crear_prospecto(self, data: dict) -> dict:
-        payload = {
-            "FirstName": data.get("nombre"),
-            "LastName":  data.get("apellido", "–"),
-            "Company":   data.get("empresa", "–"),
-            "Phone":     data.get("tel"),
-            "Email":     data.get("email"),
-            "LeadSource": "App Móvil",
-        }
-        return self.sf.create("Lead", {k: v for k, v in payload.items() if v is not None})
+    def _prospectos_cartera(self, vendedor_id: str | None) -> str:
+        """Filtro SOQL de Lead: prospectos del vendedor sin convertir, sin los estados que el tenant oculta."""
+        self._modulos_registros(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulo
+        esc = lambda s: "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
+        filtro = f"OwnerId = '{_safe_id(vendedor_id)}' AND IsConverted = false"
+        # Solo los Leads que nacen en la app: el dueño puede tener otros Leads del CRM (campañas, web, etc.).
+        if self.prospectos_lead_source:
+            filtro += f" AND LeadSource = {esc(self.prospectos_lead_source)}"
+        ocultos = [s for s in (self.prospectos_status_ocultos or []) if isinstance(s, str) and s.strip()]
+        if ocultos:
+            filtro += f" AND Status NOT IN ({', '.join(esc(s) for s in ocultos)})"
+        return filtro
 
-    def actualizar_prospecto(self, record_id: str, data: dict) -> dict:
-        payload = {k: v for k, v in data.items() if v is not None}
-        self.sf.update("Lead", _safe_id(record_id), payload)
-        return {"id": record_id, "updated": True}
+    def get_prospectos(self, vendedor_id: str | None = None) -> list[dict]:
+        filtro = self._prospectos_cartera(vendedor_id)
+        recs = self.sf.query_all(f"SELECT {self._PROSPECTO_FIELDS} FROM Lead WHERE {filtro} ORDER BY CreatedDate DESC")
+        return [self._prospecto(r) for r in recs]
+
+    def get_prospecto(self, vendedor_id: str | None, record_id: str) -> dict:
+        filtro = self._prospectos_cartera(vendedor_id)
+        if not isinstance(record_id, str) or not _SF_ID_RE.match(record_id):
+            raise ValueError(f"Prospecto {record_id} no encontrado")
+        recs = self.sf.query(f"SELECT {self._PROSPECTO_FIELDS} FROM Lead WHERE Id = '{record_id}' AND {filtro} LIMIT 1").get("records") or []
+        if not recs:
+            raise ValueError(f"Prospecto {record_id} no encontrado")
+        return self._prospecto(recs[0])
+
+    def get_prospectos_opciones(self, vendedor_id: str | None = None) -> dict:
+        """Valores válidos de las listas, tal como están en Salesforce (la app no los fija en código)."""
+        self._modulos_registros(vendedor_id)
+        op = self._opciones_lead()
+        return {"tipo_negocio": op["Tipo_negocio__c"], "dias_visita": op["Dias_de_visita__c"]}
+
+    def crear_prospecto(self, data: dict, vendedor_id: str | None = None) -> dict:
+        filtro = self._prospectos_cartera(vendedor_id)  # 403 antes de validar
+        if not isinstance(data, dict):
+            raise ValueError("Dato inválido: el body debe ser un objeto")
+        id_local = data.get("id_local")
+        if not isinstance(id_local, str) or not self._ID_LOCAL_RE.match(id_local):
+            raise ValueError("Campo requerido: id_local (1 a 36 letras, números o guiones)")
+        existente = self._prospecto_por_id_local(id_local, vendedor_id)
+        if existente:
+            return existente
+        payload = self._payload_prospecto(data, nuevo=True)
+        payload.update({"UUID__c": id_local, "OwnerId": _safe_id(vendedor_id),
+                        "LeadSource": self.prospectos_lead_source or self._LEAD_SOURCE})
+        moneda = self._moneda_vendedor(vendedor_id)  # 403 si el vendedor no tiene moneda válida
+        if moneda:
+            payload["CurrencyIsoCode"] = moneda
+        try:
+            nuevo_id = self._crear("Lead", payload)["id"]
+        except ValueError as e:
+            # Dos envíos simultáneos con el mismo id_local: gana uno; el otro devuelve el ya creado.
+            existente = "DUPLICATE_VALUE" in str(e) and self._prospecto_por_id_local(id_local, vendedor_id)
+            if existente:
+                return existente
+            raise
+        recs = self.sf.query(f"SELECT {self._PROSPECTO_FIELDS} FROM Lead WHERE Id = '{_safe_id(nuevo_id)}' AND {filtro} LIMIT 1").get("records") or []
+        return self._prospecto(recs[0]) if recs else {"id": nuevo_id, "id_local": id_local}
+
+    def actualizar_prospecto(self, record_id: str, data: dict, vendedor_id: str | None = None) -> dict:
+        self.get_prospecto(vendedor_id, record_id)  # 403 / 404 si no es un prospecto del vendedor
+        if not isinstance(data, dict):
+            raise ValueError("Dato inválido: el body debe ser un objeto")
+        if "id_local" in data:
+            raise ValueError("Dato inválido: id_local no se puede modificar")
+        payload = self._payload_prospecto(data, nuevo=False)
+        if payload:
+            try:
+                self.sf.update("Lead", record_id, payload)
+            except HTTPError as e:
+                if e.response is not None and e.response.status_code == 400:
+                    raise ValueError(f"Dato inválido: {_mensaje_sf(e.response)}") from e
+                raise
+        return self.get_prospecto(vendedor_id, record_id)
+
+    def _prospecto_por_id_local(self, id_local: str, vendedor_id: str) -> dict | None:
+        """Prospecto ya creado con ese id_local (reintento). Si es de otro vendedor: 409."""
+        recs = self.sf.query(
+            f"SELECT {self._PROSPECTO_FIELDS}, OwnerId, IsConverted FROM Lead WHERE UUID__c = '{id_local}' LIMIT 1"
+        ).get("records") or []
+        if not recs:
+            return None
+        if recs[0].get("OwnerId") != _safe_id(vendedor_id):
+            raise ConflictError(f"El id_local {id_local} ya está en uso")
+        return self._prospecto(recs[0])
+
+    def _opciones_lead(self) -> dict[str, list[str]]:
+        """Valores activos de los picklist Tipo_negocio__c y Dias_de_visita__c del Lead (una consulta por invocación)."""
+        if "_opciones_lead_cache" not in self.__dict__:
+            campos = {f["name"]: f for f in self.sf.describe("Lead").get("fields", [])}
+            self._opciones_lead_cache = {
+                n: [v["value"] for v in (campos.get(n) or {}).get("picklistValues", []) if v.get("active")]
+                for n in ("Tipo_negocio__c", "Dias_de_visita__c")
+            }
+        return self._opciones_lead_cache
+
+    def _payload_prospecto(self, data: dict, nuevo: bool) -> dict:
+        """Valida el body y lo traduce a campos de Lead. En PUT, un campo ausente no se toca y null lo borra."""
+        permitidos = set(self._PROSPECTO_TEXTOS) | set(self._PROSPECTO_OTROS)
+        extra = sorted(k for k in data if k not in permitidos)
+        if extra:
+            raise ValueError(f"Dato inválido: campo no permitido: {', '.join(extra)}")
+        payload: dict = {}
+
+        for campo, (sf_campo, largo, obligatorio) in self._PROSPECTO_TEXTOS.items():
+            if campo not in data:
+                if nuevo and obligatorio:
+                    raise ValueError(f"Campo requerido: {campo}")
+                continue
+            v = data[campo]
+            if v is not None and not isinstance(v, str):
+                raise ValueError(f"Dato inválido: {campo} debe ser texto")
+            v = (v or "").strip() or None
+            if v is None:
+                if obligatorio:
+                    raise ValueError(f"Campo requerido: {campo}")
+                if not nuevo:
+                    payload[sf_campo] = None
+                continue
+            if len(v) > largo:
+                raise ValueError(f"Dato inválido: {campo} admite máximo {largo} caracteres")
+            payload[sf_campo] = v
+
+        if "lat" in data or "lng" in data:
+            lat, lng = data.get("lat"), data.get("lng")
+            if lat is None and lng is None:
+                if not nuevo:
+                    payload["Location__Latitude__s"] = payload["Location__Longitude__s"] = None
+            elif lat is None or lng is None:
+                raise ValueError("Dato inválido: lat y lng van juntos")
+            else:
+                payload["Location__Latitude__s"] = _coordenada(data, "lat", 90)
+                payload["Location__Longitude__s"] = _coordenada(data, "lng", 180)
+
+        opciones = None
+        if "tipo_negocio" in data or nuevo:
+            v = data.get("tipo_negocio")
+            if v is None or (isinstance(v, str) and not v.strip()):
+                raise ValueError("Campo requerido: tipo_negocio")
+            opciones = self._opciones_lead()
+            if not isinstance(v, str) or v not in opciones["Tipo_negocio__c"]:
+                raise ValueError(f"Dato inválido: tipo_negocio no es un valor válido ({', '.join(opciones['Tipo_negocio__c'])})")
+            payload["Tipo_negocio__c"] = v
+
+        if "dias_visita" in data:
+            dias = data["dias_visita"]
+            if dias is None or dias == []:
+                if not nuevo:
+                    payload["Dias_de_visita__c"] = None
+            else:
+                if not isinstance(dias, list) or not all(isinstance(d, str) for d in dias):
+                    raise ValueError("Dato inválido: dias_visita debe ser una lista de textos")
+                validos = (opciones or self._opciones_lead())["Dias_de_visita__c"]
+                malos = [d for d in dias if d not in validos]
+                if malos:
+                    raise ValueError(f"Dato inválido: dias_visita no válido: {', '.join(malos)} ({', '.join(validos)})")
+                if len(set(dias)) != len(dias):
+                    raise ValueError("Dato inválido: dias_visita tiene días repetidos")
+                payload["Dias_de_visita__c"] = ";".join(sorted(dias, key=validos.index))
+        return payload
 
     def _prospecto(self, r: dict) -> dict:
+        dias = r.get("Dias_de_visita__c")
         return {
-            "id":      r["Id"],
-            "nombre":  f"{r.get('FirstName', '')} {r.get('LastName', '')}".strip(),
-            "empresa": r.get("Company"),
-            "tel":     r.get("Phone"),
-            "email":   r.get("Email"),
-            "estado":  r.get("Status"),
+            "id":                    r["Id"],
+            "id_local":              r.get("UUID__c"),
+            "nombre_negocio":        r.get("Company"),
+            "contacto":              r.get("LastName"),
+            "identificacion_fiscal": r.get("Identificacion_Fiscal__c"),
+            "telefono":              r.get("Phone"),
+            "telefono_alternativo":  r.get("MobilePhone"),
+            "direccion":             r.get("Street"),
+            "referencia":            r.get("Referencia__c"),
+            "lat":                   r.get("Location__Latitude__s"),
+            "lng":                   r.get("Location__Longitude__s"),
+            "dias_visita":           dias.split(";") if dias else [],
+            "tipo_negocio":          r.get("Tipo_negocio__c"),
+            "notas":                 r.get("Description"),
+            "fecha_creacion":        r.get("CreatedDate"),
         }
 
     # ── Visitas → Event ───────────────────────────────────────────────────────

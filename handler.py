@@ -124,13 +124,18 @@ def handler(event, context):
             return _ok(adapter.get_listas_precios())
 
         # Prospectos
+        # Prospectos (Lead): solo los del vendedor del token, sin convertir
         if path == "/prospectos" and method == "GET":
-            return _ok(adapter.get_prospectos())
+            return _ok(adapter.get_prospectos(vendedor_id=vendedor_id))
+        if path == "/prospectos/opciones" and method == "GET":
+            return _ok(adapter.get_prospectos_opciones(vendedor_id=vendedor_id))
+        if path.startswith("/prospectos/") and method == "GET":
+            return _ok(adapter.get_prospecto(vendedor_id, path.split("/")[-1]))
         if path == "/prospectos" and method == "POST":
-            return _ok(adapter.crear_prospecto(body))
-        if path.startswith("/prospectos/") and method == "PUT":
+            return _ok(adapter.crear_prospecto(body, vendedor_id=vendedor_id))
+        if path.startswith("/prospectos/") and method in ("PUT", "PATCH"):
             record_id = path.split("/")[-1]
-            return _ok(adapter.actualizar_prospecto(record_id, body))
+            return _ok(adapter.actualizar_prospecto(record_id, body, vendedor_id=vendedor_id))
 
         # Visitas
         if path == "/visitas" and method == "GET":

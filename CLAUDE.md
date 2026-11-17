@@ -76,9 +76,11 @@ Para `experenta_crm`:
 | GET    | /productos/{id}    | Producto por ID (mismos atributos, sin `precios`) |
 | GET    | /promos            | Promociones activas y vigentes hoy (fecha en la zona del tenant), con `listas_precios_ids` (de la junction `Promocion_lista_precios__c`; vacío = todas las listas), `condiciones_relacion` ("todas"), `condiciones` (`medida` unidades/cajas/monto, `operador` normalizado por_cada/igual/mayor/mayor_igual/menor/menor_igual, `valor`, filtros) y `acciones` (`tipo` bonificacion/descuento, `cantidad`, `unidad` unidades/cajas desde `TipoMedida__c`, `descuento_tipo`, `descuento_valor`). Se mantienen los campos anteriores (`estado`, `criterio`, `tipo_medida`, `marca_id`). Requiere `Tipo__c`, `Tipo_descuento__c` y `Valor_descuento__c` en la acción y la junction con `Promocion__c` y `Price_Book__c` |
 | GET    | /listas-precios    | Listas de precios activas (`Pricebook2 WHERE IsActive = true`): `[{id, nombre, activa, es_estandar}]`. No depende de `custom:vendedor_id`. Catálogo del gestor web de promociones |
-| GET    | /prospectos        | Lista prospectos              |
-| POST   | /prospectos        | Crear prospecto               |
-| PUT    | /prospectos/{id}   | Actualizar prospecto          |
+| GET    | /prospectos        | Prospectos del vendedor (ver «Prospectos (Salesforce `Lead`)»). 403 sin `custom:vendedor_id` o sin módulo |
+| GET    | /prospectos/opciones | Valores válidos de `tipo_negocio` y `dias_visita`, leídos del picklist del Lead (describe) |
+| GET    | /prospectos/{id}   | Prospecto por ID si es del vendedor, de la app y sin convertir (404 si no) |
+| POST   | /prospectos        | Crear prospecto; idempotente por `id_local` (`UUID__c`). Responde el prospecto completo |
+| PUT/PATCH | /prospectos/{id} | Editar: campo ausente no se toca, `null` lo borra (salvo obligatorios). Responde el prospecto |
 | GET    | /solicitudes       | Lista solicitudes             |
 | POST   | /solicitudes       | Crear solicitud               |
 | GET    | /visitas           | Visitas de hoy del vendedor (zona horaria del tenant); no acepta otra fecha |
@@ -92,6 +94,27 @@ El vendedor se identifica solo por el claim `custom:vendedor_id` de su ID token 
 Su cartera son las cuentas activas con `Account.Modulo__c` en alguno de sus módulos (`Modulo__c.Vendedor__c` = vendedor); sin módulo asignado responde 403. En CRM Experenta no hay módulos y `/clientes` no filtra.
 
 **Una moneda por vendedor (Salesforce):** el vendedor vende en `User.DefaultCurrencyIsoCode`. `GET /clientes`, `/pedidos` y `POST /pedidos` solo ven clientes de esa moneda (`Account.CurrencyIsoCode`) y `GET /productos` solo trae precios en ella. Si su usuario no tiene moneda válida, esos endpoints responden 403 `El vendedor <id> no tiene moneda de venta configurada`: no puede sincronizar. Solo si la org no es multimoneda (el campo no existe) no se filtra nada.
+
+### Prospectos (Salesforce `Lead`)
+
+Prospecto = Lead con `OwnerId` = vendedor, `IsConverted = false` y `LeadSource` = «App NUGO» (configurable con `prospectos_lead_source` en el secreto; `""` quita el filtro). El filtro por origen evita mostrar los Leads del CRM comercial que tenga el mismo usuario. `prospectos_status_ocultos` (lista en el secreto, opcional) oculta además los Leads en esos Status (p. ej. `["Unqualified"]`). Se personaliza Salesforce lo mínimo: estándar salvo los campos sin equivalente.
+
+| Campo API | Campo Lead | Regla |
+|---|---|---|
+| `id_local` | `UUID__c` (Text 36, External ID, Unique) | Obligatorio en POST; reintento devuelve el existente; de otro vendedor: 409; no editable |
+| `nombre_negocio` | Company | Obligatorio, máx. 255 |
+| `contacto` | LastName | Obligatorio, máx. 80 |
+| `identificacion_fiscal` | `Identificacion_Fiscal__c` (Text 20) | Opcional; al convertir se mapea a `Account.TAX_ID__c` |
+| `telefono` | Phone | Obligatorio, máx. 40 |
+| `telefono_alternativo` | MobilePhone | Opcional, máx. 40 |
+| `direccion` | Street | Obligatorio, máx. 255 |
+| `referencia` | `Referencia__c` (Text 255) | Opcional |
+| `lat`, `lng` | `Location__Latitude__s`, `Location__Longitude__s` | Opcionales, van juntos |
+| `dias_visita` | `Dias_de_visita__c` (multipicklist) | Opcional; lista de valores del picklist, sin repetidos; se guarda ordenada con `;` |
+| `tipo_negocio` | `Tipo_negocio__c` (picklist) | Obligatorio; valor exacto del picklist |
+| `notas` | Description | Opcional, máx. 255 |
+
+El Middleware pone `OwnerId` (vendedor), `LeadSource` y `CurrencyIsoCode` (moneda del vendedor; 403 si no tiene en org multimoneda). No envía `Status`: Salesforce pone el valor por defecto de la org y lo maneja la oficina. Cualquier otro campo en el body: 400. La conversión a cliente la hace la oficina en Salesforce.
 
 ### Visitas (Salesforce `Event`)
 
