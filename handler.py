@@ -6,6 +6,7 @@ import requests as http_requests
 from adapters.base import ConflictError
 from adapters.salesforce import SalesforceAdapter
 from adapters.experenta_crm import ExperentaCRMAdapter
+from promos_dynamo import PromosDynamo
 from secrets_manager import get_credentials
 
 
@@ -25,7 +26,12 @@ class TokenExpiredError(Exception):
 
 
 def handler(event, context):
-    claims = event.get("requestContext", {}).get("authorizer", {}).get("jwt", {}).get("claims", {})
+    # Preflight CORS del gestor web: la ruta OPTIONS /{proxy+} llega sin token. API Gateway agrega los
+    # headers de CORS; aquí solo se responde 204 sin leer claims ni tocar el CRM.
+    if event.get("requestContext", {}).get("http", {}).get("method") == "OPTIONS":
+        return {"statusCode": 204, "headers": {}, "body": ""}
+
+    claims =event.get("requestContext", {}).get("authorizer", {}).get("jwt", {}).get("claims", {})
     tenant_id = claims.get("custom:tenant_id")
     # app_id válidos: nugo_standard_preventa | nugo_standard_reparto | nugo_standard_cobranza
     app_id = claims.get("custom:app_id")
@@ -51,6 +57,14 @@ def handler(event, context):
             raise TenantNotFoundError(f"Tenant '{tenant_id}' no encontrado")
         crm_type = creds.get("crm_type", "salesforce")
         adapter = _get_adapter(crm_type, creds)
+        # Fuente de promos por tenant: "salesforce" (default) o "dynamodb" (gestor web promos-app).
+        promos_source = creds.get("promos_source", "salesforce")
+        if promos_source == "dynamodb":
+            if not hasattr(adapter, "promos_externas"):
+                raise ValueError(f"promos_source=dynamodb no soportado con crm_type {crm_type}")
+            adapter.promos_externas = PromosDynamo(tenant_id)
+        elif promos_source != "salesforce":
+            raise ValueError(f"promos_source inválido en el secreto del tenant: {promos_source!r}")
     except TenantNotFoundError as e:
         return _error(404, str(e))
     except Exception as e:
@@ -105,14 +119,23 @@ def handler(event, context):
         if path == "/promos" and method == "GET":
             return _ok(adapter.get_promos())
 
+        # Listas de precios (catálogo del gestor web de promociones)
+        if path == "/listas-precios" and method == "GET":
+            return _ok(adapter.get_listas_precios())
+
         # Prospectos
+        # Prospectos (Lead): solo los del vendedor del token, sin convertir
         if path == "/prospectos" and method == "GET":
-            return _ok(adapter.get_prospectos())
+            return _ok(adapter.get_prospectos(vendedor_id=vendedor_id))
+        if path == "/prospectos/opciones" and method == "GET":
+            return _ok(adapter.get_prospectos_opciones(vendedor_id=vendedor_id))
+        if path.startswith("/prospectos/") and method == "GET":
+            return _ok(adapter.get_prospecto(vendedor_id, path.split("/")[-1]))
         if path == "/prospectos" and method == "POST":
-            return _ok(adapter.crear_prospecto(body))
-        if path.startswith("/prospectos/") and method == "PUT":
+            return _ok(adapter.crear_prospecto(body, vendedor_id=vendedor_id))
+        if path.startswith("/prospectos/") and method in ("PUT", "PATCH"):
             record_id = path.split("/")[-1]
-            return _ok(adapter.actualizar_prospecto(record_id, body))
+            return _ok(adapter.actualizar_prospecto(record_id, body, vendedor_id=vendedor_id))
 
         # Visitas
         if path == "/visitas" and method == "GET":

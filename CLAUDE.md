@@ -41,6 +41,8 @@ Cada tenant tiene un secreto con esta forma mínima:
 
 Opcional: `"utc_offset": "-06:00"` define la zona horaria del tenant para `GET /visitas`.
 
+Opcional: `"promos_source": "salesforce" | "dynamodb"` (default `salesforce`). Con `dynamodb` las promos salen de la tabla del gestor web `promos-app` (ver "Fuente de promociones"). Cualquier otro valor da 500 al cargar el tenant.
+
 Para `experenta_crm`:
 
 ```json
@@ -73,9 +75,12 @@ Para `experenta_crm`:
 | GET    | /productos         | Productos activos con `marca`, `categoria`, `presentacion`, `capacidad`, `iva_porcentaje` (`Product2.IVA__c`), `unidades_por_caja` y `precios[]`: un elemento por lista de precios (incluida la estándar) con `lista_precios_id`, `lista_precios`, `precio` (`UnitPrice`) y `precio_caja` (`List_Box_Price__c`). `precio` (nivel producto) se mantiene por compatibilidad y sale del Pricebook estándar. Requiere los campos nuevos de `Product2` y `PricebookEntry` legibles por la integración |
 | GET    | /productos/{id}    | Producto por ID (mismos atributos, sin `precios`) |
 | GET    | /promos            | Promociones activas y vigentes hoy (fecha en la zona del tenant), con `listas_precios_ids` (de la junction `Promocion_lista_precios__c`; vacío = todas las listas), `condiciones_relacion` ("todas"), `condiciones` (`medida` unidades/cajas/monto, `operador` normalizado por_cada/igual/mayor/mayor_igual/menor/menor_igual, `valor`, filtros) y `acciones` (`tipo` bonificacion/descuento, `cantidad`, `unidad` unidades/cajas desde `TipoMedida__c`, `descuento_tipo`, `descuento_valor`). Se mantienen los campos anteriores (`estado`, `criterio`, `tipo_medida`, `marca_id`). Requiere `Tipo__c`, `Tipo_descuento__c` y `Valor_descuento__c` en la acción y la junction con `Promocion__c` y `Price_Book__c` |
-| GET    | /prospectos        | Lista prospectos              |
-| POST   | /prospectos        | Crear prospecto               |
-| PUT    | /prospectos/{id}   | Actualizar prospecto          |
+| GET    | /listas-precios    | Listas de precios activas (`Pricebook2 WHERE IsActive = true`): `[{id, nombre, activa, es_estandar}]`. No depende de `custom:vendedor_id`. Catálogo del gestor web de promociones |
+| GET    | /prospectos        | Prospectos del vendedor (ver «Prospectos (Salesforce `Lead`)»). 403 sin `custom:vendedor_id` o sin módulo |
+| GET    | /prospectos/opciones | Valores válidos de `tipo_negocio` y `dias_visita`, leídos del picklist del Lead (describe) |
+| GET    | /prospectos/{id}   | Prospecto por ID si es del vendedor, de la app y sin convertir (404 si no) |
+| POST   | /prospectos        | Crear prospecto; idempotente por `id_local` (`UUID__c`). Responde el prospecto completo |
+| PUT/PATCH | /prospectos/{id} | Editar: campo ausente no se toca, `null` lo borra (salvo obligatorios). Responde el prospecto |
 | GET    | /solicitudes       | Lista solicitudes             |
 | POST   | /solicitudes       | Crear solicitud               |
 | GET    | /visitas           | Visitas de hoy del vendedor (zona horaria del tenant); no acepta otra fecha |
@@ -87,6 +92,29 @@ Para `experenta_crm`:
 El vendedor se identifica solo por el claim `custom:vendedor_id` de su ID token de Cognito (Id del `User` de Salesforce, que el app client no debe poder escribir). Nunca por email: sin ese claim, `/clientes` y `/visitas` responden 403.
 
 Su cartera son las cuentas activas con `Account.Modulo__c` en alguno de sus módulos (`Modulo__c.Vendedor__c` = vendedor); sin módulo asignado responde 403. En CRM Experenta no hay módulos y `/clientes` no filtra.
+
+**Una moneda por vendedor (Salesforce):** el vendedor vende en `User.DefaultCurrencyIsoCode`. `GET /clientes`, `/pedidos` y `POST /pedidos` solo ven clientes de esa moneda (`Account.CurrencyIsoCode`) y `GET /productos` solo trae precios en ella. Si su usuario no tiene moneda válida, esos endpoints responden 403 `El vendedor <id> no tiene moneda de venta configurada`: no puede sincronizar. Solo si la org no es multimoneda (el campo no existe) no se filtra nada.
+
+### Prospectos (Salesforce `Lead`)
+
+Prospecto = Lead con `OwnerId` = vendedor, `IsConverted = false` y `LeadSource` = «App NUGO» (configurable con `prospectos_lead_source` en el secreto; `""` quita el filtro). El filtro por origen evita mostrar los Leads del CRM comercial que tenga el mismo usuario. `prospectos_status_ocultos` (lista en el secreto, opcional) oculta además los Leads en esos Status (p. ej. `["Unqualified"]`). Se personaliza Salesforce lo mínimo: estándar salvo los campos sin equivalente.
+
+| Campo API | Campo Lead | Regla |
+|---|---|---|
+| `id_local` | `UUID__c` (Text 36, External ID, Unique) | Obligatorio en POST; reintento devuelve el existente; de otro vendedor: 409; no editable |
+| `nombre_negocio` | Company | Obligatorio, máx. 255 |
+| `contacto` | LastName | Obligatorio, máx. 80 |
+| `identificacion_fiscal` | `Identificacion_Fiscal__c` (Text 20) | Opcional; al convertir se mapea a `Account.TAX_ID__c` |
+| `telefono` | Phone | Obligatorio, máx. 40 |
+| `telefono_alternativo` | MobilePhone | Opcional, máx. 40 |
+| `direccion` | Street | Obligatorio, máx. 255 |
+| `referencia` | `Referencia__c` (Text 255) | Opcional |
+| `lat`, `lng` | `Location__Latitude__s`, `Location__Longitude__s` | Opcionales, van juntos |
+| `dias_visita` | `Dias_de_visita__c` (multipicklist) | Opcional; lista de valores del picklist, sin repetidos; se guarda ordenada con `;` |
+| `tipo_negocio` | `Tipo_negocio__c` (picklist) | Obligatorio; valor exacto del picklist |
+| `notas` | Description | Opcional, máx. 255 |
+
+El Middleware pone `OwnerId` (vendedor), `LeadSource` y `CurrencyIsoCode` (moneda del vendedor; 403 si no tiene en org multimoneda). No envía `Status`: Salesforce pone el valor por defecto de la org y lo maneja la oficina. Cualquier otro campo en el body: 400. La conversión a cliente la hace la oficina en Salesforce.
 
 ### Visitas (Salesforce `Event`)
 
@@ -113,6 +141,23 @@ Body de `PUT /visitas/{id}`:
 - Check out: `{"fecha_fin", "lat_fin", "lng_fin", "estado": "completada" | "sin_compra"}`. Requiere check in previo (o en el mismo body) y `fecha_fin >= fecha_inicio`.
 - Fechas ISO 8601 con zona horaria. `GET /visitas` devuelve `fecha_inicio` y `fecha_fin` (null sin check in / check out) para que la app sepa qué visitas están en curso o cerradas, pero no coordenadas; `GET /visitas/{id}` devuelve todo.
 
+### Fuente de promociones (Salesforce o DynamoDB)
+
+Por tenant, según `promos_source` del secreto. Con `dynamodb`, `handler.py` asigna `adapter.promos_externas = PromosDynamo(tenant_id)` (`promos_dynamo.py`):
+
+- Tabla `PROMOS_TABLE` (env var), escrita solo por el gestor web `C:\Users\Angel's PC\promos-app`. `PK = TENANT#<tenant_id>` (siempre el claim del token), `SK = PROMO#<ulid>`, promo embebida.
+- `GET /promos` emite el mismo JSON que `_promo()` de Salesforce (mismos filtros: Activa, vigente hoy en `utc_offset`, ≥1 condición y ≥1 acción con tipo). Decimal de DynamoDB sale como float, igual que Salesforce.
+- `POST /pedidos`: `promo_id`/`bonificacion_id` deben ser ULID (26 caracteres) vigentes del tenant; un Id de Salesforce da 400 `inválido`. Se guardan en `OrderItem.Promocion_Externa_Id__c` / `Bonificacion_Externa_Id__c` (texto), porque `Promocion__c` es lookup. `GET /pedidos` devuelve `promo_id`/`bonificacion_id` del campo que tenga valor; si la org no tiene los campos externos, `_query_pedidos` reintenta sin ellos (primer fallback de 4).
+- Rollback: `promos_source` a `salesforce` (los pedidos ya creados conservan su id externo).
+- `PromosDynamo` abre la tabla al primer uso: si falta `PROMOS_TABLE`, solo `GET /promos` y `POST /pedidos` con promo dan 500; el resto del tenant sigue funcionando.
+
+**Checklist antes de poner un tenant en `promos_source=dynamodb`** (en este orden):
+1. Campos texto `OrderItem.Promocion_Externa_Id__c` y `OrderItem.Bonificacion_Externa_Id__c` creados y con permiso de escritura para la integración (sin ellos el create de OrderItem da 400 y el pedido se deshace).
+2. Lambda con env var `PROMOS_TABLE` y permiso IAM `dynamodb:Query` y `dynamodb:GetItem` sobre la tabla.
+3. Promos migradas a DynamoDB (`promos-app/scripts/migrar-desde-salesforce.ts`) y revisadas en el gestor web.
+4. Vendedores del tenant con todos sus pedidos pendientes sincronizados: un pedido offline con `promo_id` de Salesforce recibe 400 `promo_id inválido` después del cambio.
+5. Cambiar el secreto y probar `GET /promos` y un `POST /pedidos` con promo en Postman.
+
 ## Seguridad
 
 - IDs de Salesforce validados con regex `^[a-zA-Z0-9]{15,18}$` antes de cualquier query.
@@ -127,10 +172,11 @@ python build_zip.py
 aws lambda update-function-code --function-name nugo-standard-middleware --zip-file fileb://function.zip --region us-east-2
 ```
 
-`build_zip.py` construye el ZIP correctamente: incluye `adapters/` desde el código fuente y aplana `package/` en la raíz, evitando que dependencias antiguas en `package/` sobreescriban el código propio.
+`build_zip.py` empaqueta el código de su propia carpeta (sirve desde un git worktree). `package/` no está versionado: en un worktree usa `PACKAGE_DIR=D:\nugo-standard-middleware\package python build_zip.py`. Construye el ZIP correctamente: incluye `adapters/` desde el código fuente y aplana `package/` en la raíz, evitando que dependencias antiguas en `package/` sobreescriban el código propio.
 
 ## Variables de entorno Lambda
 
 | Variable    | Descripción                        |
 |-------------|------------------------------------|
 | `MOCK_MODE` | `true` activa respuestas simuladas |
+| `PROMOS_TABLE` | Tabla DynamoDB del gestor web (`nugo-promociones-<env>`). Requerida si algún tenant tiene `promos_source=dynamodb` |

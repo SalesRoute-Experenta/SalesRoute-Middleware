@@ -87,7 +87,7 @@ class ExperentaCRMAdapter(CRMAdapter):
 
     # ── Prospectos → Leads ────────────────────────────────────────────────────
 
-    def get_prospectos(self) -> list[dict]:
+    def get_prospectos(self, vendedor_id: str | None = None) -> list[dict]:
         page, all_rows = 1, []
         while True:
             result = self._call("buscar_leads", {"page": page, "limit": 200})
@@ -99,7 +99,7 @@ class ExperentaCRMAdapter(CRMAdapter):
             page += 1
         return all_rows
 
-    def crear_prospecto(self, data: dict) -> dict:
+    def crear_prospecto(self, data: dict, vendedor_id: str | None = None) -> dict:
         if not data.get("nombre"):
             raise ValueError("Campo requerido: nombre")
         result = self._call("crear_lead", {"payload": {
@@ -113,7 +113,7 @@ class ExperentaCRMAdapter(CRMAdapter):
         }})
         return {"id": result.get("id"), "estado": "Identified"}
 
-    def actualizar_prospecto(self, record_id: str, data: dict) -> dict:
+    def actualizar_prospecto(self, record_id: str, data: dict, vendedor_id: str | None = None) -> dict:
         raise NotImplementedError("Actualizar prospecto: pendiente en MCP")
 
     def _prospecto(self, r: dict) -> dict:

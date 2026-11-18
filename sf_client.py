@@ -61,6 +61,11 @@ class SalesforceClient:
             records.extend(data.get("records", []))
         return records
 
+    def describe(self, sobject: str) -> dict:
+        resp = requests.get(f"{self._base()}/sobjects/{sobject}/describe", headers=self._headers(), timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+
     def create(self, sobject: str, payload: dict) -> dict:
         resp = requests.post(
             f"{self._base()}/sobjects/{sobject}",
