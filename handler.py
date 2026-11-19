@@ -87,7 +87,8 @@ def handler(event, context):
 
         # Pedidos
         if path == "/pedidos" and method == "GET":
-            return _ok(adapter.get_pedidos(vendedor_id, qs.get("cliente_id")))
+            # ?prospecto_id= filtra los pedidos de un prospecto.
+            return _ok(adapter.get_pedidos(vendedor_id, qs.get("cliente_id"), qs.get("prospecto_id")))
         if path.startswith("/pedidos/") and method == "GET":
             record_id = path.split("/")[-1]
             return _ok(adapter.get_pedido(vendedor_id, record_id))

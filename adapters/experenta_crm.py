@@ -130,7 +130,10 @@ class ExperentaCRMAdapter(CRMAdapter):
     # ── Pedidos → Cotizaciones ────────────────────────────────────────────────
 
     # En CRM Experenta no hay módulos: igual que /clientes, no se filtra por vendedor.
-    def get_pedidos(self, vendedor_id: str | None, cliente_id: str | None = None) -> list[dict]:
+    def get_pedidos(self, vendedor_id: str | None, cliente_id: str | None = None,
+                    prospecto_id: str | None = None) -> list[dict]:
+        if prospecto_id:
+            return []   # CRM Experenta no tiene pedidos de prospectos
         result = self._call("buscar_cotizaciones", {"limit": 200})
         pedidos = [self._pedido(r) for r in result.get("data", [])]
         if cliente_id:
