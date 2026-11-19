@@ -89,6 +89,9 @@ class SalesforceAdapter(CRMAdapter):
     # Fuente de promos externa (promos_dynamo.PromosDynamo) si el tenant tiene promos_source="dynamodb".
     # None = promos en Salesforce (Promocion__c). La asigna handler.py.
     promos_externas = None
+    # Cuenta genérica (Account Id) donde se guardan los pedidos de prospectos: Order exige AccountId.
+    # None = el tenant no toma pedidos de prospectos. Se lee de "pedidos_prospectos_cuenta" en el secreto.
+    pedidos_prospectos_cuenta = None
 
     def __init__(self, creds: dict):
         self.sf = SalesforceClient(creds)
@@ -99,6 +102,10 @@ class SalesforceAdapter(CRMAdapter):
         # Origen (LeadSource) de los Leads que crea la app; GET /prospectos solo muestra esos.
         # "" en el secreto = sin filtro por origen (todos los Leads del vendedor).
         self.prospectos_lead_source = creds.get("prospectos_lead_source", self._LEAD_SOURCE)
+        cuenta = creds.get("pedidos_prospectos_cuenta")
+        if cuenta is not None and (not isinstance(cuenta, str) or not _SF_ID_RE.match(cuenta)):
+            raise ValueError(f"pedidos_prospectos_cuenta inválido en el secreto del tenant: {cuenta!r}")
+        self.pedidos_prospectos_cuenta = cuenta or None
 
     # ── Clientes ──────────────────────────────────────────────────────────────
 
@@ -159,7 +166,8 @@ class SalesforceAdapter(CRMAdapter):
     # ── Pedidos ───────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _pedido_fields(con_bonif_id: bool = True, con_retorno: bool = True, con_externa: bool = True) -> str:
+    def _pedido_fields(con_bonif_id: bool = True, con_retorno: bool = True, con_externa: bool = True,
+                       con_prospecto: bool = False) -> str:
         extra = ", BonificacionId__c" if con_bonif_id else ""
         if con_externa:
             # Ids de promos de DynamoDB (texto): Promocion__c es lookup y no acepta ULID.
@@ -168,6 +176,8 @@ class SalesforceAdapter(CRMAdapter):
             extra += (", Tipo_Linea__c, Motivo_Retorno__c, Estado_Producto__c, Lote__c, "
                       "Fecha_Vencimiento__c, Comentario__c")
         tipo = ", Type" if con_retorno else ""
+        if con_prospecto:
+            tipo += ", Prospecto__c"
         return (
             f"Id, OrderNumber, Status, TotalAmount, AccountId, EffectiveDate, CreatedDate, "
             f"Subtotal__c, Descuento__c, IVA__c, Total__c{tipo}, "
@@ -181,22 +191,35 @@ class SalesforceAdapter(CRMAdapter):
         sin BonificacionId__c."""
         run = self.sf.query_all if todo else self.sf.query
         variantes = ((True, True, True), (True, True, False), (True, False, False), (False, False, False))
+        # Prospecto__c solo si el tenant toma pedidos de prospectos (el filtro de cartera ya lo exige).
+        prospecto = bool(self.pedidos_prospectos_cuenta)
         for k, (bonif, retorno, externa) in enumerate(variantes):
             try:
-                return run(f"SELECT {self._pedido_fields(bonif, retorno, externa)} FROM Order {tail}")
+                return run(f"SELECT {self._pedido_fields(bonif, retorno, externa, prospecto)} FROM Order {tail}")
             except HTTPError as e:
                 if e.response is None or e.response.status_code != 400 or k == len(variantes) - 1:
                     raise
 
     # Los pedidos del vendedor son los de los clientes de su cartera (mismo filtro que /clientes).
     # Con ?cliente_id= de un cliente fuera de la cartera la lista sale vacía, sin revelar nada.
+    # Con pedidos de prospectos se suman los de la cuenta genérica cuyo prospecto (Lead) es del vendedor.
     def _pedidos_cartera(self, vendedor_id: str | None) -> str:
-        return f"AccountId IN (SELECT Id FROM Account WHERE {self._cartera_venta(vendedor_id)})"
+        gen = self.pedidos_prospectos_cuenta
+        if not gen:
+            return f"AccountId IN (SELECT Id FROM Account WHERE {self._cartera_venta(vendedor_id)})"
+        # SOQL no admite un semi-join con OR: la cartera se filtra por la relación Account.
+        return (f"(({self._cartera_venta(vendedor_id, 'Account.')}) OR "
+                f"(AccountId = '{_safe_id(gen)}' AND Prospecto__r.OwnerId = '{_safe_id(vendedor_id)}'))")
 
-    def get_pedidos(self, vendedor_id: str | None, cliente_id: str | None = None) -> list[dict]:
+    def get_pedidos(self, vendedor_id: str | None, cliente_id: str | None = None,
+                    prospecto_id: str | None = None) -> list[dict]:
         filtro = self._pedidos_cartera(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulos
         if cliente_id:
             filtro += f" AND AccountId = '{_safe_id(cliente_id)}'"
+        if prospecto_id:
+            if not self.pedidos_prospectos_cuenta:
+                return []
+            filtro += f" AND Prospecto__c = '{_safe_id(prospecto_id)}'"
         records = self._query_pedidos(f"WHERE {filtro} ORDER BY CreatedDate DESC", todo=True)
         reemplazos = self._reemplazos(records)
         return [self._pedido(r, reemplazos.get(r["Id"])) for r in records]
@@ -230,8 +253,15 @@ class SalesforceAdapter(CRMAdapter):
 
     def crear_pedido(self, vendedor_id: str | None, data: dict) -> dict:
         from datetime import date
+        if data.get("prospecto_id") is not None:
+            # Pedido de prospecto: solo con el contrato de totales (lineas) y sin cliente_id.
+            if data.get("cliente_id") is not None:
+                raise ValueError("Dato inválido: envía cliente_id o prospecto_id, no ambos")
+            if "lineas" not in data:
+                raise ValueError("Campo requerido: lineas")
+            return self._crear_pedido_validado(vendedor_id, data)
         if not data.get("cliente_id"):
-            raise ValueError("Campo requerido: cliente_id")
+            raise ValueError("Campo requerido: cliente_id o prospecto_id")
         if "lineas" in data:
             return self._crear_pedido_validado(vendedor_id, data)
         self._validar_cliente_en_cartera(vendedor_id, data["cliente_id"])
@@ -342,7 +372,8 @@ class SalesforceAdapter(CRMAdapter):
         return o
 
     def _crear_pedido_validado(self, vendedor_id: str | None, data: dict) -> dict:
-        cliente_id = data["cliente_id"]
+        cliente_id = data.get("cliente_id")
+        prospecto_id = data.get("prospecto_id")
         id_local = data.get("id_local")
         if id_local is not None and (not isinstance(id_local, str) or not self._ID_LOCAL_RE.match(id_local)):
             raise ValueError("Dato inválido: id_local debe ser texto de 1 a 36 caracteres (letras, números y guiones)")
@@ -360,14 +391,24 @@ class SalesforceAdapter(CRMAdapter):
         tipo_pedido = data.get("tipo")
         if tipo_pedido is not None and tipo_pedido not in self._TIPOS_PEDIDO:
             raise ValueError("Dato inválido: tipo debe ser nuevo, cambio o devolucion")
-        if original_id is not None:
-            self._validar_original(vendedor_id, original_id, cliente_id, tipo_pedido)
-        cliente = self._cliente_de_cartera(vendedor_id, cliente_id)
+        if prospecto_id is not None:
+            # Un prospecto solo recibe pedidos nuevos: cambios y devoluciones esperan a que sea cliente.
+            if tipo_pedido not in (None, "nuevo"):
+                raise ValueError("Dato inválido: un pedido de prospecto solo puede ser tipo nuevo")
+            if original_id is not None:
+                raise ValueError("Dato inválido: un pedido de prospecto no lleva pedido_original_id")
+            cliente = self._prospecto_para_pedido(vendedor_id, prospecto_id)
+            quien = "prospecto"
+        else:
+            if original_id is not None:
+                self._validar_original(vendedor_id, original_id, cliente_id, tipo_pedido)
+            cliente = self._cliente_de_cartera(vendedor_id, cliente_id)
+            quien = "cliente"
         lista = cliente.get("Price_Book__c")
         if not lista:
-            raise ValueError("Dato inválido: el cliente no tiene lista de precios")
+            raise ValueError(f"Dato inválido: el {quien} no tiene lista de precios")
         if data.get("lista_precios_id") != lista:
-            raise ValueError("Dato inválido: lista_precios_id no es la lista de precios del cliente")
+            raise ValueError(f"Dato inválido: lista_precios_id no es la lista de precios del {quien}")
         tipo = tipo_pedido
         fecha = data.get("fecha") or date.today().isoformat()
         if not isinstance(fecha, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", fecha):
@@ -417,7 +458,7 @@ class SalesforceAdapter(CRMAdapter):
             pid = l["producto_id"]
             entrada = entradas.get(pid)
             if not entrada:
-                raise ValueError(f"Dato inválido: {n}: el producto {pid} no tiene precio en la lista del cliente"+(f" en {moneda}" if moneda else ""))
+                raise ValueError(f"Dato inválido: {n}: el producto {pid} no tiene precio en la lista del {quien}"+(f" en {moneda}" if moneda else ""))
             cant = self._dec(l.get("cantidad"), f"{n}: cantidad")
             if cant <= 0 or cant != cant.to_integral_value():
                 raise ValueError(f"Dato inválido: {n}: cantidad debe ser un entero mayor que 0")
@@ -478,7 +519,8 @@ class SalesforceAdapter(CRMAdapter):
 
         # Sin transacción multi-objeto en este flujo: si falla una línea se borra el pedido (todo o nada).
         order_id = self._crear("Order", {
-            "AccountId": cliente_id, "Status": "Draft", "EffectiveDate": fecha, "Pricebook2Id": lista,
+            "AccountId": cliente["Id"], "Status": "Draft", "EffectiveDate": fecha, "Pricebook2Id": lista,
+            **({"Prospecto__c": prospecto_id} if prospecto_id is not None else {}),
             "Type": (tipo or "nuevo").capitalize(),
             **({"UUID__c": id_local} if id_local else {}),
             **({"Pedido_Original_Id__c": original_id} if original_id else {}),
@@ -524,7 +566,27 @@ class SalesforceAdapter(CRMAdapter):
                 "id_local": id_local, "total": float(t_total)}
         if original_id:
             resp.update({"pedido_original_id": original_id, "original_anulado": True})
+        if prospecto_id is not None:
+            resp["prospecto_id"] = prospecto_id
         return resp
+
+    def _prospecto_para_pedido(self, vendedor_id: str | None, prospecto_id) -> dict:
+        """Destino de un pedido de prospecto: la cuenta genérica del tenant, con la lista de precios del prospecto
+        y la moneda del vendedor. El prospecto debe ser del vendedor y no estar convertido (si no, 404)."""
+        gen = self.pedidos_prospectos_cuenta
+        if not gen:
+            raise PermissionError("La empresa no tiene habilitados los pedidos de prospectos")
+        filtro = self._prospectos_cartera(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulos
+        if not isinstance(prospecto_id, str) or not _SF_ID_RE.match(prospecto_id):
+            raise ValueError(f"Prospecto {prospecto_id} no encontrado")
+        if not self._lead_con_lista():
+            raise PermissionError("Falta el campo Price_Book__c en Lead: no se pueden tomar pedidos de prospectos")
+        recs = self.sf.query(
+            f"SELECT Id, Price_Book__c FROM Lead WHERE Id = '{prospecto_id}' AND {filtro} LIMIT 1").get("records") or []
+        if not recs:
+            raise ValueError(f"Prospecto {prospecto_id} no encontrado")
+        return {"Id": gen, "Price_Book__c": recs[0].get("Price_Book__c"),
+                "CurrencyIsoCode": self._moneda_vendedor(vendedor_id)}
 
     def _validar_retorno(self, n: str, l: dict, tipo_pedido: str | None) -> dict:
         """Campos por línea de cambio y devolución (contrato 10.1). Devuelve el payload de OrderItem.
@@ -698,7 +760,9 @@ class SalesforceAdapter(CRMAdapter):
             "subtotal":   r.get("Subtotal__c"),
             "descuento":  r.get("Descuento__c"),
             "iva":        r.get("IVA__c"),
-            "cliente_id": r.get("AccountId"),
+            # Un pedido de prospecto sin convertir está en la cuenta genérica: no tiene cliente todavía.
+            "cliente_id": None if r.get("AccountId") == self.pedidos_prospectos_cuenta else r.get("AccountId"),
+            "prospecto_id": r.get("Prospecto__c"),
             "fecha":          r.get("EffectiveDate"),
             "fecha_creacion": r.get("CreatedDate"),
             "lineas": [
@@ -967,12 +1031,35 @@ class SalesforceAdapter(CRMAdapter):
         "referencia":            ("Referencia__c", 255, False),
         "notas":                 ("Description", 255, False),
     }
-    _PROSPECTO_OTROS = ("id_local", "lat", "lng", "dias_visita", "tipo_negocio")
+    _PROSPECTO_OTROS = ("id_local", "lat", "lng", "dias_visita", "tipo_negocio", "lista_precios_id")
     _PROSPECTO_FIELDS = (
         "Id, UUID__c, Company, LastName, Identificacion_Fiscal__c, Phone, MobilePhone, Street, Referencia__c, "
         "Location__Latitude__s, Location__Longitude__s, Dias_de_visita__c, Tipo_negocio__c, Description, CreatedDate"
     )
     _LEAD_SOURCE = "App NUGO"
+
+    def _prospecto_fields(self) -> str:
+        # Lista de precios del prospecto (Lead.Price_Book__c) solo si el campo existe en la org.
+        return self._PROSPECTO_FIELDS + (", Price_Book__c, Price_Book__r.Name" if self._lead_con_lista() else "")
+
+    def _lead_campos(self) -> dict[str, dict]:
+        """Describe de Lead, una vez por invocación: picklists y campos opcionales."""
+        if "_lead_campos_cache" not in self.__dict__:
+            self._lead_campos_cache = {f["name"]: f for f in self.sf.describe("Lead").get("fields", [])}
+        return self._lead_campos_cache
+
+    def _lead_con_lista(self) -> bool:
+        return "Price_Book__c" in self._lead_campos()
+
+    def _listas_vendedor(self, vendedor_id: str | None) -> list[dict]:
+        """Listas de precios que puede elegir el vendedor para un prospecto: las de los clientes de su cartera."""
+        if "_listas_vendedor_cache" not in self.__dict__:
+            recs = self.sf.query(
+                f"SELECT Price_Book__c, Price_Book__r.Name FROM Account WHERE {self._cartera_venta(vendedor_id)} "
+                "AND Price_Book__c != null GROUP BY Price_Book__c, Price_Book__r.Name ORDER BY Price_Book__r.Name"
+            ).get("records") or []
+            self._listas_vendedor_cache = [{"id": r["Price_Book__c"], "nombre": r.get("Name")} for r in recs]
+        return self._listas_vendedor_cache
 
     def _prospectos_cartera(self, vendedor_id: str | None) -> str:
         """Filtro SOQL de Lead: prospectos del vendedor sin convertir, sin los estados que el tenant oculta."""
@@ -989,14 +1076,14 @@ class SalesforceAdapter(CRMAdapter):
 
     def get_prospectos(self, vendedor_id: str | None = None) -> list[dict]:
         filtro = self._prospectos_cartera(vendedor_id)
-        recs = self.sf.query_all(f"SELECT {self._PROSPECTO_FIELDS} FROM Lead WHERE {filtro} ORDER BY CreatedDate DESC")
+        recs = self.sf.query_all(f"SELECT {self._prospecto_fields()} FROM Lead WHERE {filtro} ORDER BY CreatedDate DESC")
         return [self._prospecto(r) for r in recs]
 
     def get_prospecto(self, vendedor_id: str | None, record_id: str) -> dict:
         filtro = self._prospectos_cartera(vendedor_id)
         if not isinstance(record_id, str) or not _SF_ID_RE.match(record_id):
             raise ValueError(f"Prospecto {record_id} no encontrado")
-        recs = self.sf.query(f"SELECT {self._PROSPECTO_FIELDS} FROM Lead WHERE Id = '{record_id}' AND {filtro} LIMIT 1").get("records") or []
+        recs = self.sf.query(f"SELECT {self._prospecto_fields()} FROM Lead WHERE Id = '{record_id}' AND {filtro} LIMIT 1").get("records") or []
         if not recs:
             raise ValueError(f"Prospecto {record_id} no encontrado")
         return self._prospecto(recs[0])
@@ -1005,7 +1092,8 @@ class SalesforceAdapter(CRMAdapter):
         """Valores válidos de las listas, tal como están en Salesforce (la app no los fija en código)."""
         self._modulos_registros(vendedor_id)
         op = self._opciones_lead()
-        return {"tipo_negocio": op["Tipo_negocio__c"], "dias_visita": op["Dias_de_visita__c"]}
+        return {"tipo_negocio": op["Tipo_negocio__c"], "dias_visita": op["Dias_de_visita__c"],
+                "listas_precios": self._listas_vendedor(vendedor_id) if self._lead_con_lista() else []}
 
     def crear_prospecto(self, data: dict, vendedor_id: str | None = None) -> dict:
         filtro = self._prospectos_cartera(vendedor_id)  # 403 antes de validar
@@ -1017,7 +1105,7 @@ class SalesforceAdapter(CRMAdapter):
         existente = self._prospecto_por_id_local(id_local, vendedor_id)
         if existente:
             return existente
-        payload = self._payload_prospecto(data, nuevo=True)
+        payload = self._payload_prospecto(data, nuevo=True, vendedor_id=vendedor_id)
         payload.update({"UUID__c": id_local, "OwnerId": _safe_id(vendedor_id),
                         "LeadSource": self.prospectos_lead_source or self._LEAD_SOURCE})
         moneda = self._moneda_vendedor(vendedor_id)  # 403 si el vendedor no tiene moneda válida
@@ -1031,7 +1119,7 @@ class SalesforceAdapter(CRMAdapter):
             if existente:
                 return existente
             raise
-        recs = self.sf.query(f"SELECT {self._PROSPECTO_FIELDS} FROM Lead WHERE Id = '{_safe_id(nuevo_id)}' AND {filtro} LIMIT 1").get("records") or []
+        recs = self.sf.query(f"SELECT {self._prospecto_fields()} FROM Lead WHERE Id = '{_safe_id(nuevo_id)}' AND {filtro} LIMIT 1").get("records") or []
         return self._prospecto(recs[0]) if recs else {"id": nuevo_id, "id_local": id_local}
 
     def actualizar_prospecto(self, record_id: str, data: dict, vendedor_id: str | None = None) -> dict:
@@ -1040,7 +1128,7 @@ class SalesforceAdapter(CRMAdapter):
             raise ValueError("Dato inválido: el body debe ser un objeto")
         if "id_local" in data:
             raise ValueError("Dato inválido: id_local no se puede modificar")
-        payload = self._payload_prospecto(data, nuevo=False)
+        payload = self._payload_prospecto(data, nuevo=False, vendedor_id=vendedor_id)
         if payload:
             try:
                 self.sf.update("Lead", record_id, payload)
@@ -1053,7 +1141,7 @@ class SalesforceAdapter(CRMAdapter):
     def _prospecto_por_id_local(self, id_local: str, vendedor_id: str) -> dict | None:
         """Prospecto ya creado con ese id_local (reintento). Si es de otro vendedor: 409."""
         recs = self.sf.query(
-            f"SELECT {self._PROSPECTO_FIELDS}, OwnerId, IsConverted FROM Lead WHERE UUID__c = '{id_local}' LIMIT 1"
+            f"SELECT {self._prospecto_fields()}, OwnerId, IsConverted FROM Lead WHERE UUID__c = '{id_local}' LIMIT 1"
         ).get("records") or []
         if not recs:
             return None
@@ -1064,14 +1152,14 @@ class SalesforceAdapter(CRMAdapter):
     def _opciones_lead(self) -> dict[str, list[str]]:
         """Valores activos de los picklist Tipo_negocio__c y Dias_de_visita__c del Lead (una consulta por invocación)."""
         if "_opciones_lead_cache" not in self.__dict__:
-            campos = {f["name"]: f for f in self.sf.describe("Lead").get("fields", [])}
+            campos = self._lead_campos()
             self._opciones_lead_cache = {
                 n: [v["value"] for v in (campos.get(n) or {}).get("picklistValues", []) if v.get("active")]
                 for n in ("Tipo_negocio__c", "Dias_de_visita__c")
             }
         return self._opciones_lead_cache
 
-    def _payload_prospecto(self, data: dict, nuevo: bool) -> dict:
+    def _payload_prospecto(self, data: dict, nuevo: bool, vendedor_id: str | None = None) -> dict:
         """Valida el body y lo traduce a campos de Lead. En PUT, un campo ausente no se toca y null lo borra."""
         permitidos = set(self._PROSPECTO_TEXTOS) | set(self._PROSPECTO_OTROS)
         extra = sorted(k for k in data if k not in permitidos)
@@ -1134,6 +1222,21 @@ class SalesforceAdapter(CRMAdapter):
                 if len(set(dias)) != len(dias):
                     raise ValueError("Dato inválido: dias_visita tiene días repetidos")
                 payload["Dias_de_visita__c"] = ";".join(sorted(dias, key=validos.index))
+
+        # Lista de precios: obligatoria al crear si la org tiene Lead.Price_Book__c; una de las listas de los
+        # clientes de la cartera del vendedor. Al convertir pasa a Account.Price_Book__c (Map Lead Fields).
+        if self._lead_con_lista():
+            if "lista_precios_id" in data or nuevo:
+                v = data.get("lista_precios_id")
+                if v is None or (isinstance(v, str) and not v.strip()):
+                    raise ValueError("Campo requerido: lista_precios_id")
+                validas = self._listas_vendedor(vendedor_id)
+                if not isinstance(v, str) or v not in {x["id"] for x in validas}:
+                    raise ValueError("Dato inválido: lista_precios_id no es una de las listas de tus clientes "
+                                     "(ver GET /prospectos/opciones)")
+                payload["Price_Book__c"] = v
+        elif "lista_precios_id" in data:
+            raise ValueError("Dato inválido: lista_precios_id no está disponible (falta Lead.Price_Book__c en Salesforce)")
         return payload
 
     def _prospecto(self, r: dict) -> dict:
@@ -1152,6 +1255,8 @@ class SalesforceAdapter(CRMAdapter):
             "lng":                   r.get("Location__Longitude__s"),
             "dias_visita":           dias.split(";") if dias else [],
             "tipo_negocio":          r.get("Tipo_negocio__c"),
+            "lista_precios_id":      r.get("Price_Book__c"),
+            "lista_precios":         (r.get("Price_Book__r") or {}).get("Name"),
             "notas":                 r.get("Description"),
             "fecha_creacion":        r.get("CreatedDate"),
         }
@@ -1250,9 +1355,10 @@ class SalesforceAdapter(CRMAdapter):
         # SOQL no anida semi-joins, por eso los módulos se consultan aparte.
         return ", ".join(f"'{_safe_id(r['Id'])}'" for r in self._modulos_registros(vendedor_id))
 
-    def _cartera(self, vendedor_id: str | None) -> str:
+    def _cartera(self, vendedor_id: str | None, rel: str = "") -> str:
         # Filtro SOQL de Account: la cartera del vendedor son las cuentas activas de sus módulos.
-        return f"Activo__c = true AND Modulo__c IN ({self._modulos(vendedor_id)})"
+        # rel="Account." lo aplica desde otro objeto por la relación (p. ej. en Order).
+        return f"{rel}Activo__c = true AND {rel}Modulo__c IN ({self._modulos(vendedor_id)})"
 
     def _moneda_vendedor(self, vendedor_id: str | None) -> str | None:
         """Moneda de venta del vendedor: User.DefaultCurrencyIsoCode. None si la org no es multimoneda o el usuario no existe.
@@ -1277,11 +1383,11 @@ class SalesforceAdapter(CRMAdapter):
             cache[vid] = m if valida else None
         return cache[vid]
 
-    def _cartera_venta(self, vendedor_id: str | None) -> str:
+    def _cartera_venta(self, vendedor_id: str | None, rel: str = "") -> str:
         """Cartera del vendedor limitada a su moneda de venta: un vendedor atiende una sola moneda."""
-        cartera = self._cartera(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulos
+        cartera = self._cartera(vendedor_id, rel)  # 403 si no hay vendedor_id o no tiene módulos
         moneda = self._moneda_vendedor(vendedor_id)
-        return f"{cartera} AND CurrencyIsoCode = '{moneda}'" if moneda else cartera
+        return f"{cartera} AND {rel}CurrencyIsoCode = '{moneda}'" if moneda else cartera
 
     def _visitas_cartera(self, vendedor_id: str | None) -> str:
         # Filtro SOQL de Event: las visitas son las de los clientes de la cartera.
