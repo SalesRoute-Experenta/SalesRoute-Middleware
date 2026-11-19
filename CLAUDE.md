@@ -119,11 +119,11 @@ El Middleware pone `OwnerId` (vendedor), `LeadSource` y `CurrencyIsoCode` (moned
 
 ### Pedidos de prospectos (cuenta genérica)
 
-`Order` exige `AccountId` (sin él Salesforce responde `REQUIRED_FIELD_MISSING`), así que un pedido de prospecto se guarda en una **cuenta genérica** del tenant (`pedidos_prospectos_cuenta` en el secreto, Account Id) con `Order.Prospecto__c` (lookup a Lead). Sin esa clave el tenant no toma pedidos de prospectos (403) y todo funciona como antes.
+`Order` exige `AccountId` (sin él Salesforce responde `REQUIRED_FIELD_MISSING`), así que un pedido de prospecto se guarda en una **cuenta genérica** con `Order.Prospecto__c` (lookup a Lead). La cuenta genérica es la Account con `EsGenerico__c = true` (checkbox; se consulta una vez por invocación). Sin el campo o sin cuentas marcadas, el tenant no toma pedidos de prospectos (403) y todo funciona como antes. Con más de una marcada, `GET /pedidos` las incluye todas pero `POST /pedidos` de prospecto responde 403 hasta que quede una.
 
 - `POST /pedidos` con `prospecto_id` en lugar de `cliente_id` (uno de los dos; ambos: 400). Solo con `lineas`, tipo `nuevo` y sin `pedido_original_id`. El prospecto debe ser del vendedor, de la app y sin convertir (si no, 404). Precios de `Lead.Price_Book__c` (sin lista: 400; `lista_precios_id` debe coincidir) en la moneda del vendedor. Sin `Lead.Price_Book__c` en la org: 403.
 - La cuenta genérica no debe tener módulo (no sale en ninguna cartera). Una sola sirve para todas las monedas: el pedido lleva la moneda del vendedor (probado: pedido GTQ en cuenta HNL).
-- `GET /pedidos` suma los pedidos de la cuenta genérica cuyo `Prospecto__r.OwnerId` es el vendedor. SOQL no admite semi-join con `OR`, por eso con la clave configurada la cartera se filtra por relación (`Account.Activo__c`, `Account.Modulo__c`, `Account.CurrencyIsoCode`). Cada pedido trae `prospecto_id`; en la cuenta genérica `cliente_id` sale `null`. `?prospecto_id=` filtra por prospecto.
+- `GET /pedidos` suma los pedidos de la cuenta genérica cuyo `Prospecto__r.OwnerId` es el vendedor. SOQL no admite semi-join con `OR`, por eso con cuenta genérica la cartera se filtra por relación (`Account.Activo__c`, `Account.Modulo__c`, `Account.CurrencyIsoCode`). Cada pedido trae `prospecto_id`; en la cuenta genérica `cliente_id` sale `null`. `?prospecto_id=` filtra por prospecto.
 - Al convertir, un Flow de Salesforce debe pasar los pedidos con `Prospecto__c` = el Lead a la cuenta nueva: Draft → `AccountId` = `ConvertedAccountId` → Activated (Salesforce no deja cambiar la cuenta de un pedido activado). El pedido conserva su lista de precios.
 
 ### Visitas (Salesforce `Event`)

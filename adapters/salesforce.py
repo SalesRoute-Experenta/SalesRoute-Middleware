@@ -89,9 +89,6 @@ class SalesforceAdapter(CRMAdapter):
     # Fuente de promos externa (promos_dynamo.PromosDynamo) si el tenant tiene promos_source="dynamodb".
     # None = promos en Salesforce (Promocion__c). La asigna handler.py.
     promos_externas = None
-    # Cuenta genérica (Account Id) donde se guardan los pedidos de prospectos: Order exige AccountId.
-    # None = el tenant no toma pedidos de prospectos. Se lee de "pedidos_prospectos_cuenta" en el secreto.
-    pedidos_prospectos_cuenta = None
 
     def __init__(self, creds: dict):
         self.sf = SalesforceClient(creds)
@@ -102,10 +99,20 @@ class SalesforceAdapter(CRMAdapter):
         # Origen (LeadSource) de los Leads que crea la app; GET /prospectos solo muestra esos.
         # "" en el secreto = sin filtro por origen (todos los Leads del vendedor).
         self.prospectos_lead_source = creds.get("prospectos_lead_source", self._LEAD_SOURCE)
-        cuenta = creds.get("pedidos_prospectos_cuenta")
-        if cuenta is not None and (not isinstance(cuenta, str) or not _SF_ID_RE.match(cuenta)):
-            raise ValueError(f"pedidos_prospectos_cuenta inválido en el secreto del tenant: {cuenta!r}")
-        self.pedidos_prospectos_cuenta = cuenta or None
+
+    def _cuentas_genericas(self) -> list[str]:
+        """Cuentas genéricas (Account.EsGenerico__c = true) donde se guardan los pedidos de prospectos: Order exige
+        AccountId. Una consulta por invocación. Sin el campo en la org o sin cuentas marcadas: [] (sin pedidos de
+        prospectos, todo lo demás igual)."""
+        if "_cuentas_genericas_cache" not in self.__dict__:
+            try:
+                recs = self.sf.query("SELECT Id FROM Account WHERE EsGenerico__c = true ORDER BY Id LIMIT 10").get("records") or []
+            except HTTPError as e:
+                if e.response is None or e.response.status_code != 400:
+                    raise
+                recs = []
+            self._cuentas_genericas_cache = [r["Id"] for r in recs]
+        return self._cuentas_genericas_cache
 
     # ── Clientes ──────────────────────────────────────────────────────────────
 
@@ -192,7 +199,7 @@ class SalesforceAdapter(CRMAdapter):
         run = self.sf.query_all if todo else self.sf.query
         variantes = ((True, True, True), (True, True, False), (True, False, False), (False, False, False))
         # Prospecto__c solo si el tenant toma pedidos de prospectos (el filtro de cartera ya lo exige).
-        prospecto = bool(self.pedidos_prospectos_cuenta)
+        prospecto = bool(self._cuentas_genericas())
         for k, (bonif, retorno, externa) in enumerate(variantes):
             try:
                 return run(f"SELECT {self._pedido_fields(bonif, retorno, externa, prospecto)} FROM Order {tail}")
@@ -204,12 +211,14 @@ class SalesforceAdapter(CRMAdapter):
     # Con ?cliente_id= de un cliente fuera de la cartera la lista sale vacía, sin revelar nada.
     # Con pedidos de prospectos se suman los de la cuenta genérica cuyo prospecto (Lead) es del vendedor.
     def _pedidos_cartera(self, vendedor_id: str | None) -> str:
-        gen = self.pedidos_prospectos_cuenta
+        cartera = self._cartera_venta(vendedor_id)  # 403 (sin vendedor, módulo o moneda) antes de consultar nada más
+        gen = self._cuentas_genericas()
         if not gen:
-            return f"AccountId IN (SELECT Id FROM Account WHERE {self._cartera_venta(vendedor_id)})"
+            return f"AccountId IN (SELECT Id FROM Account WHERE {cartera})"
         # SOQL no admite un semi-join con OR: la cartera se filtra por la relación Account.
+        ids = ", ".join(f"'{_safe_id(g)}'" for g in gen)
         return (f"(({self._cartera_venta(vendedor_id, 'Account.')}) OR "
-                f"(AccountId = '{_safe_id(gen)}' AND Prospecto__r.OwnerId = '{_safe_id(vendedor_id)}'))")
+                f"(AccountId IN ({ids}) AND Prospecto__r.OwnerId = '{_safe_id(vendedor_id)}'))")
 
     def get_pedidos(self, vendedor_id: str | None, cliente_id: str | None = None,
                     prospecto_id: str | None = None) -> list[dict]:
@@ -217,7 +226,7 @@ class SalesforceAdapter(CRMAdapter):
         if cliente_id:
             filtro += f" AND AccountId = '{_safe_id(cliente_id)}'"
         if prospecto_id:
-            if not self.pedidos_prospectos_cuenta:
+            if not self._cuentas_genericas():
                 return []
             filtro += f" AND Prospecto__c = '{_safe_id(prospecto_id)}'"
         records = self._query_pedidos(f"WHERE {filtro} ORDER BY CreatedDate DESC", todo=True)
@@ -573,10 +582,13 @@ class SalesforceAdapter(CRMAdapter):
     def _prospecto_para_pedido(self, vendedor_id: str | None, prospecto_id) -> dict:
         """Destino de un pedido de prospecto: la cuenta genérica del tenant, con la lista de precios del prospecto
         y la moneda del vendedor. El prospecto debe ser del vendedor y no estar convertido (si no, 404)."""
-        gen = self.pedidos_prospectos_cuenta
-        if not gen:
-            raise PermissionError("La empresa no tiene habilitados los pedidos de prospectos")
         filtro = self._prospectos_cartera(vendedor_id)  # 403 si no hay vendedor_id o no tiene módulos
+        genericas = self._cuentas_genericas()
+        if not genericas:
+            raise PermissionError("La empresa no tiene habilitados los pedidos de prospectos (sin cuenta EsGenerico__c)")
+        if len(genericas) > 1:
+            raise PermissionError("Hay más de una cuenta marcada EsGenerico__c: debe haber una sola")
+        gen = genericas[0]
         if not isinstance(prospecto_id, str) or not _SF_ID_RE.match(prospecto_id):
             raise ValueError(f"Prospecto {prospecto_id} no encontrado")
         if not self._lead_con_lista():
@@ -761,7 +773,7 @@ class SalesforceAdapter(CRMAdapter):
             "descuento":  r.get("Descuento__c"),
             "iva":        r.get("IVA__c"),
             # Un pedido de prospecto sin convertir está en la cuenta genérica: no tiene cliente todavía.
-            "cliente_id": None if r.get("AccountId") == self.pedidos_prospectos_cuenta else r.get("AccountId"),
+            "cliente_id": None if r.get("AccountId") in self._cuentas_genericas() else r.get("AccountId"),
             "prospecto_id": r.get("Prospecto__c"),
             "fecha":          r.get("EffectiveDate"),
             "fecha_creacion": r.get("CreatedDate"),
@@ -1344,8 +1356,11 @@ class SalesforceAdapter(CRMAdapter):
         if not vendedor_id:
             raise PermissionError("El token no trae custom:vendedor_id")
         vendedor_id = _safe_id(vendedor_id)
-        data = self.sf.query(f"SELECT Id, Name FROM Modulo__c WHERE Vendedor__c = '{vendedor_id}' ORDER BY Name")
-        modulos = data.get("records", [])
+        cache = self.__dict__.setdefault("_modulos_cache", {})   # una consulta por invocación
+        if vendedor_id not in cache:
+            data = self.sf.query(f"SELECT Id, Name FROM Modulo__c WHERE Vendedor__c = '{vendedor_id}' ORDER BY Name")
+            cache[vendedor_id] = data.get("records", [])
+        modulos = cache[vendedor_id]
         if not modulos:
             raise PermissionError(f"El vendedor {vendedor_id} no tiene módulo asignado")
         return modulos
